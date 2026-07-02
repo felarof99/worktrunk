@@ -5,6 +5,7 @@
 //! shared by the `wt switch` argument path and the interactive picker.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::display::format_relative_time_short;
@@ -21,10 +22,11 @@ use worktrunk::git::remote_ref::{
     RemoteRefProvider, parse_ref_url,
 };
 use worktrunk::git::{
-    GitError, GitRemoteUrl, RefContext, RefType, Repository, SwitchSuggestionCtx,
-    current_or_recover,
+    BranchCategory, CompletionBranch, GitError, GitRemoteUrl, RefContext, RefType, Repository,
+    SwitchSuggestionCtx, WorktrunkError, current_or_recover,
 };
-use worktrunk::shell_exec::{ShellEscapeMode, directive_shell_escape_mode, shell_escape_for};
+use worktrunk::path::to_posix_path;
+use worktrunk::shell_exec::{Cmd, ShellEscapeMode, directive_shell_escape_mode, shell_escape_for};
 use worktrunk::styling::{
     eprintln, format_with_gutter, hint_message, info_message, progress_message, suggest_command,
     warning_message,
@@ -52,6 +54,126 @@ struct ResolvedTarget {
     branch: String,
     /// How to create the worktree
     method: CreationMethod,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FzfSwitchCandidate {
+    marker: char,
+    branch: String,
+    detail: String,
+}
+
+impl FzfSwitchCandidate {
+    fn from_completion(branch: CompletionBranch) -> Self {
+        match branch.category {
+            BranchCategory::Worktree => Self {
+                marker: '+',
+                branch: branch.name,
+                detail: "worktree".to_string(),
+            },
+            BranchCategory::Local => Self {
+                marker: '/',
+                branch: branch.name,
+                detail: "local".to_string(),
+            },
+            BranchCategory::Remote(remotes) => {
+                let detail = if remotes.is_empty() {
+                    "remote".to_string()
+                } else {
+                    format!("remote: {}", remotes.join(", "))
+                };
+                Self {
+                    marker: '|',
+                    branch: branch.name,
+                    detail,
+                }
+            }
+        }
+    }
+
+    fn render_line(&self) -> String {
+        format!("{}\t{}\t{}", self.marker, self.branch, self.detail)
+    }
+
+    fn parse_selected_line(line: &str) -> Option<String> {
+        let branch = line.split('\t').nth(1)?.trim();
+        (!branch.is_empty()).then(|| branch.to_string())
+    }
+}
+
+fn fzf_switch_candidates(
+    repo: &Repository,
+    show_branches: bool,
+    show_remotes: bool,
+) -> anyhow::Result<Vec<FzfSwitchCandidate>> {
+    let candidates = repo
+        .branches_for_completion()?
+        .into_iter()
+        .filter(|branch| fzf_candidate_visible(&branch.category, show_branches, show_remotes))
+        .map(FzfSwitchCandidate::from_completion)
+        .collect();
+    Ok(candidates)
+}
+
+fn fzf_candidate_visible(
+    category: &BranchCategory,
+    show_branches: bool,
+    show_remotes: bool,
+) -> bool {
+    match category {
+        BranchCategory::Worktree => true,
+        BranchCategory::Local => show_branches,
+        BranchCategory::Remote(_) => show_remotes,
+    }
+}
+
+fn run_fzf_switch_picker(candidates: &[FzfSwitchCandidate]) -> anyhow::Result<Option<String>> {
+    if candidates.is_empty() {
+        bail!("No switch targets available");
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("fzf picker requires an interactive terminal");
+    }
+    if which::which("fzf").is_err() {
+        bail!("fzf not found; install fzf or use wt switch for the built-in picker");
+    }
+
+    let input = candidates
+        .iter()
+        .map(FzfSwitchCandidate::render_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let selection_path = tempfile::NamedTempFile::new()
+        .context("Failed to create fzf selection file")?
+        .into_temp_path();
+    let selection_path_buf = selection_path.to_path_buf();
+    let selection_path_posix = to_posix_path(&selection_path_buf.to_string_lossy());
+    let selection_path_str = shell_escape::unix::escape(selection_path_posix.into());
+    let command =
+        format!("fzf --prompt='worktree> ' --height=80% --reverse > {selection_path_str}");
+
+    if let Err(err) = Cmd::shell(command)
+        .stdin_bytes(input)
+        .inherit_stdin()
+        .forward_signals()
+        .stream()
+    {
+        if let Some(WorktrunkError::ChildProcessExited { code, .. }) =
+            err.downcast_ref::<WorktrunkError>()
+            && matches!(*code, 1 | 130)
+        {
+            return Ok(None);
+        }
+        return Err(err.context("fzf picker failed"));
+    }
+
+    let selected =
+        std::fs::read_to_string(&selection_path_buf).context("Failed to read fzf selection")?;
+    let Some(line) = selected.lines().next() else {
+        return Ok(None);
+    };
+    Ok(FzfSwitchCandidate::parse_selected_line(line))
 }
 
 /// Format PR/MR context for gutter display after fetching.
@@ -1865,7 +1987,40 @@ pub fn handle_switch_command(args: SwitchArgs, yes: bool) -> anyhow::Result<()> 
             let change_dir_flag = flag_pair(args.cd, args.no_cd);
 
             let Some(branch) = args.branch else {
-                // No branch argument: open the interactive picker.
+                if args.fzf {
+                    if args.format == SwitchFormat::Json {
+                        bail!("--fzf cannot be combined with --format=json");
+                    }
+
+                    let (repo, _is_recovered) =
+                        current_or_recover().context("Failed to switch worktree")?;
+                    let repo_config = repo.config();
+                    let show_branches = args.branches || repo_config.list.branches();
+                    let show_remotes = args.remotes || repo_config.list.remotes();
+                    let candidates = fzf_switch_candidates(&repo, show_branches, show_remotes)?;
+                    let Some(identifier) = run_fzf_switch_picker(&candidates)? else {
+                        return Ok(());
+                    };
+
+                    return run_switch(
+                        SwitchOptions {
+                            branch: &identifier,
+                            create: false,
+                            base: None,
+                            execute: None,
+                            execute_args: &[],
+                            yes,
+                            clobber: false,
+                            change_dir: change_dir_flag,
+                            verify,
+                            format: args.format,
+                        },
+                        &mut config,
+                        &crate::binary_name(),
+                    );
+                }
+
+                // No branch argument: open the built-in interactive picker.
                 return crate::commands::handle_picker(
                     args.branches,
                     args.remotes,
@@ -2076,7 +2231,87 @@ fn validate_switch_templates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use worktrunk::git::{BranchCategory, CompletionBranch};
     use worktrunk::testing::TestRepo;
+
+    #[test]
+    fn fzf_worktree_candidate_round_trips_branch_name() {
+        let candidate = FzfSwitchCandidate::from_completion(CompletionBranch {
+            name: "feature/auth".to_string(),
+            timestamp: 10,
+            category: BranchCategory::Worktree,
+        });
+
+        assert_eq!(candidate.render_line(), "+\tfeature/auth\tworktree");
+        assert_eq!(
+            FzfSwitchCandidate::parse_selected_line(&candidate.render_line()).as_deref(),
+            Some("feature/auth")
+        );
+    }
+
+    #[test]
+    fn fzf_local_candidate_round_trips_branch_name() {
+        let candidate = FzfSwitchCandidate::from_completion(CompletionBranch {
+            name: "bugfix/login".to_string(),
+            timestamp: 9,
+            category: BranchCategory::Local,
+        });
+
+        assert_eq!(candidate.render_line(), "/\tbugfix/login\tlocal");
+        assert_eq!(
+            FzfSwitchCandidate::parse_selected_line(&candidate.render_line()).as_deref(),
+            Some("bugfix/login")
+        );
+    }
+
+    #[test]
+    fn fzf_remote_candidate_keeps_remote_context_but_switches_local_name() {
+        let candidate = FzfSwitchCandidate::from_completion(CompletionBranch {
+            name: "release".to_string(),
+            timestamp: 8,
+            category: BranchCategory::Remote(vec!["origin".to_string(), "upstream".to_string()]),
+        });
+
+        assert_eq!(
+            candidate.render_line(),
+            "|\trelease\tremote: origin, upstream"
+        );
+        assert_eq!(
+            FzfSwitchCandidate::parse_selected_line(&candidate.render_line()).as_deref(),
+            Some("release")
+        );
+    }
+
+    #[test]
+    fn fzf_selected_line_requires_branch_field() {
+        assert_eq!(FzfSwitchCandidate::parse_selected_line(""), None);
+        assert_eq!(FzfSwitchCandidate::parse_selected_line("+"), None);
+        assert_eq!(
+            FzfSwitchCandidate::parse_selected_line("+\t\tworktree"),
+            None
+        );
+    }
+
+    #[test]
+    fn fzf_candidate_visibility_honors_branch_and_remote_flags() {
+        assert!(fzf_candidate_visible(
+            &BranchCategory::Worktree,
+            false,
+            false
+        ));
+        assert!(!fzf_candidate_visible(&BranchCategory::Local, false, false));
+        assert!(fzf_candidate_visible(&BranchCategory::Local, true, false));
+        assert!(!fzf_candidate_visible(
+            &BranchCategory::Remote(vec!["origin".to_string()]),
+            true,
+            false
+        ));
+        assert!(fzf_candidate_visible(
+            &BranchCategory::Remote(vec!["origin".to_string()]),
+            false,
+            true
+        ));
+    }
 
     #[test]
     fn is_clean_program_token_matches_only_bare_names() {

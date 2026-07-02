@@ -361,6 +361,10 @@ pub(crate) struct SwitchArgs {
     #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["create", "base", "execute", "execute_args", "clobber"])]
     pub(crate) prs: bool,
 
+    /// Use external fzf picker
+    #[arg(long, help_heading = "Picker Options", conflicts_with_all = ["branch", "create", "base", "execute", "execute_args", "clobber", "prs"])]
+    pub(crate) fzf: bool,
+
     /// Create a new branch
     #[arg(short = 'c', long, requires = "branch")]
     pub(crate) create: bool,
@@ -655,6 +659,12 @@ Shortcuts also apply to `--base`. For a fork PR/MR, the head commit is fetched a
 When called without arguments, `wt switch` opens an interactive picker to browse and select worktrees with live preview. The candidate set widens with `--branches` (local branches without worktrees), `--remotes` (remote branches), and `--prs` (open PRs/MRs — see below).
 
 The CI column shows each row's PR/MR CI and review status, the same as [`wt list --full`](@/list.md).
+
+## fzf picker
+
+Run `wt switch --fzf` to use an external fzf selector instead of the built-in picker. This mode lists worktrees by default, honors `--branches` and `--remotes`, and switches the selected branch through the same hook and shell-integration path as `wt switch <branch>`.
+
+The fzf picker is intentionally lightweight: no preview tabs, create/remove shortcuts, or `--prs` rows. Use the built-in picker for those.
 
 <!-- demo: wt-switch-picker.gif 1600x800 -->
 **Keybindings:**
@@ -2391,7 +2401,9 @@ This composes with aliases — an alias body can invoke `wt --config-set … <co
 
 #[cfg(test)]
 mod tests {
-    use super::{non_empty_branch, resolve_version};
+    use clap::error::ErrorKind;
+
+    use super::{build_command, non_empty_branch, resolve_version};
 
     #[test]
     fn non_empty_branch_rejects_blank() {
@@ -2422,5 +2434,23 @@ mod tests {
         // Building from the crates.io package archive: no git worktree, so the
         // build script never sets VERGEN_GIT_DESCRIBE (#3123).
         assert_eq!(resolve_version(None, "0.59.0"), "0.59.0");
+    }
+
+    #[test]
+    fn switch_fzf_rejects_explicit_branch() {
+        let err = build_command()
+            .try_get_matches_from(["wt", "switch", "--fzf", "feature"])
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn switch_fzf_rejects_pr_picker_mode() {
+        let err = build_command()
+            .try_get_matches_from(["wt", "switch", "--fzf", "--prs"])
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 }
