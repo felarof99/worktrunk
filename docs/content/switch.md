@@ -60,12 +60,6 @@ When called without arguments, `wt switch` opens an interactive picker to browse
 
 The CI column shows each row's PR/MR CI and review status, the same as [`wt list --full`](@/list.md).
 
-## fzf picker
-
-Run `wt switch --fzf` to use an external fzf selector instead of the built-in picker. This mode lists worktrees by default, honors `--branches` and `--remotes`, and switches the selected branch through the same hook and shell-integration path as `wt switch <branch>`.
-
-The fzf picker is intentionally lightweight: no preview tabs, create/remove shortcuts, or `--prs` rows. Use the built-in picker for those.
-
 <figure class="demo">
 <picture>
   <source srcset="/assets/docs/dark/wt-switch-picker.gif" media="(prefers-color-scheme: dark)">
@@ -218,9 +212,6 @@ Usage: <b><span class=c>wt switch</span></b> <span class=c>[OPTIONS]</span> <spa
 
       <b><span class=c>--prs</span></b>
           Include open PRs/MRs
-
-      <b><span class=c>--fzf</span></b>
-          Use external fzf picker
 
 <b><span class=g>Automation:</span></b>
       <b><span class=c>--no-hooks</span></b>
