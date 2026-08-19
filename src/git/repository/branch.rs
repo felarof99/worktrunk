@@ -2,6 +2,34 @@
 
 use super::Repository;
 
+/// Whether `refs/heads/<name>` is a well-formed ref, which is what a branch is.
+///
+/// A worktree selector is tried as a branch first and as a path second (see
+/// [`Repository::resolve_worktree`](super::Repository::resolve_worktree)), so
+/// when neither matches, the error has to pick which of the two the user meant.
+/// This answers it: a name git could never put under `refs/heads/` — an
+/// absolute path, `~/…`, `./…`, a Windows drive letter — was only ever a path,
+/// and reporting it as a missing branch sends the user to `wt list --branches`
+/// for something that would never appear there.
+///
+/// The rules are git's own, as `git check-ref-format refs/heads/<name>` applies
+/// them; `branch_name_matches_git_check_ref_format` pins each one against that
+/// command. In-process because it runs wherever a selector fails to resolve,
+/// where a subprocess would buy nothing.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    if name.is_empty() || name.ends_with('.') || name.contains("..") || name.contains("@{") {
+        return false;
+    }
+    if name.chars().any(|c| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return false;
+    }
+    // An empty component covers a leading `/`, a trailing `/`, and `//`.
+    name.split('/')
+        .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
 /// A handle for running git commands on a specific branch.
 ///
 /// This type holds a reference to [`Repository`] and a branch name.
@@ -108,31 +136,6 @@ impl<'a> Branch<'a> {
         self.repo
             .run_command(&["branch", "--unset-upstream", "--", &self.name])?;
         Ok(())
-    }
-
-    /// Get the remote where this branch would be pushed.
-    ///
-    /// Uses [`@{push}` syntax][1] which resolves through:
-    /// 1. `branch.<name>.pushRemote` (branch-specific push remote)
-    /// 2. `remote.pushDefault` (default push remote for all branches)
-    /// 3. `branch.<name>.remote` (tracking remote)
-    ///
-    /// Returns `None` if no push destination is configured.
-    ///
-    /// [1]: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-emltbraboranchgtpaboranchgtpush
-    pub fn push_remote(&self) -> Option<String> {
-        let push_ref = self
-            .repo
-            .run_command(&[
-                "rev-parse",
-                "--abbrev-ref",
-                &format!("{}@{{push}}", self.name),
-            ])
-            .ok()?;
-
-        // Returns "origin/branch", extract remote name
-        let remote = push_ref.trim().split('/').next()?;
-        (!remote.is_empty()).then(|| remote.to_string())
     }
 
     /// Get the URL of the remote where this branch would be pushed.

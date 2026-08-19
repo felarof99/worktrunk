@@ -194,28 +194,9 @@ fn test_list_json_no_url_without_template(repo: TestRepo) {
 ///
 /// Only worktrees should have URLs - branches without worktrees can't have running dev servers.
 #[rstest]
-fn test_list_url_with_branches_flag(repo: TestRepo) {
+fn test_list_url_with_branches_flag(mut repo: TestRepo) {
     // Remove fixture worktrees and their branches to isolate test (keep only main worktree)
-    for branch in &["feature-a", "feature-b", "feature-c"] {
-        let worktree_path = repo
-            .root_path()
-            .parent()
-            .unwrap()
-            .join(format!("repo.{}", branch));
-        if worktree_path.exists() {
-            let _ = repo
-                .git_command()
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree_path.to_str().unwrap(),
-                ])
-                .run();
-        }
-        // Delete the branch after removing the worktree
-        let _ = repo.git_command().args(["branch", "-D", branch]).run();
-    }
+    repo.remove_fixture_worktrees();
 
     // Create a branch without a worktree
     repo.run_git(&["branch", "feature"]);
@@ -285,59 +266,6 @@ url = "http://localhost:8080/{{ branch }}"
 
     let url = first["url"].as_str().unwrap();
     assert_eq!(url, "http://localhost:8080/main");
-}
-
-/// Test that task-timeout-ms config option is parsed correctly.
-/// We use a very short timeout (1ms) to trigger timeouts.
-#[rstest]
-fn test_list_config_timeout_triggers_timeouts(repo: TestRepo) {
-    fs::write(
-        repo.test_config_path(),
-        r#"[list]
-task-timeout-ms = 1
-"#,
-    )
-    .unwrap();
-
-    let mut cmd = wt_command();
-    repo.configure_wt_cmd(&mut cmd);
-    cmd.arg("list").current_dir(repo.root_path());
-
-    let output = cmd.output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // With a 1ms timeout, some tasks should time out
-    // The footer should show the timeout count
-    assert!(
-        stderr.contains("timed out") || output.status.success(),
-        "Expected either timeout message in footer or success (if git was fast enough)"
-    );
-}
-
-/// Test that task-timeout-ms = 0 explicitly disables timeout.
-#[rstest]
-fn test_list_config_timeout_zero_means_no_timeout(repo: TestRepo) {
-    fs::write(
-        repo.test_config_path(),
-        r#"[list]
-task-timeout-ms = 0
-"#,
-    )
-    .unwrap();
-
-    let mut cmd = wt_command();
-    repo.configure_wt_cmd(&mut cmd);
-    cmd.arg("list").current_dir(repo.root_path());
-
-    let output = cmd.output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // With task-timeout-ms = 0, there should be no timeout
-    assert!(
-        !stderr.contains("timed out"),
-        "Expected no timeout message with task-timeout-ms = 0, but got: {}",
-        stderr
-    );
 }
 
 /// Regression: setting a typed env-var override (e.g. `WORKTRUNK__LIST__TIMEOUT_MS`)
@@ -708,33 +636,6 @@ fn test_list_config_malformed_system_config_non_section_field(repo: TestRepo) {
 
         assert_cmd_snapshot!(cmd);
     });
-}
-
-/// Test that --full disables the task timeout.
-#[rstest]
-fn test_list_config_timeout_disabled_with_full(repo: TestRepo) {
-    fs::write(
-        repo.test_config_path(),
-        r#"[list]
-task-timeout-ms = 1
-"#,
-    )
-    .unwrap();
-
-    let mut cmd = wt_command();
-    repo.configure_wt_cmd(&mut cmd);
-    cmd.args(["list", "--full"]).current_dir(repo.root_path());
-
-    let output = cmd.output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // With --full, the timeout is disabled so we shouldn't see timeout messages
-    // (though tasks may still fail for other reasons)
-    assert!(
-        !stderr.contains("timed out"),
-        "Expected no timeout message with --full flag, but got: {}",
-        stderr
-    );
 }
 
 #[rstest]
@@ -1206,6 +1107,63 @@ columns = ["branch", "age"]
         "`--format json` must ignore `[list] columns` and emit working_tree regardless of the selection"
     );
 }
+
+/// A listed `ci` renders the CI column in the table without `--full` (asserted
+/// in `test_list_config_listed_column_overrides_full_gate`), but `--format
+/// json` plans off `--full` alone (#3787). Asserted on schema 2's
+/// `collected.ci`, which records what the plan requested rather than what a
+/// fetch returned — so this needs no forge and no `gh` on PATH.
+#[rstest]
+fn test_list_json_columns_selection_does_not_force_ci(repo: TestRepo) {
+    let collected = |config: &str, full: bool| -> serde_json::Value {
+        fs::write(repo.test_config_path(), config).unwrap();
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["list", "--format=json"]);
+        if full {
+            cmd.arg("--full");
+        }
+        cmd.current_dir(repo.root_path());
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "exit code should be 0 for config {config:?} (full={full}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["collected"].clone()
+    };
+
+    // Control: no selection, no `--full` — nothing gated was requested.
+    assert_eq!(
+        collected(SCHEMA_2_ONLY, false)["ci"],
+        serde_json::Value::Bool(false),
+        "plain `--format json` should not request CI data"
+    );
+
+    // Listing `ci` shows the column in the table, but leaves JSON's plan alone.
+    assert_eq!(
+        collected(SCHEMA_2_WITH_CI_COLUMN, false)["ci"],
+        serde_json::Value::Bool(false),
+        "a listed `ci` column must not force the forge fetch on for `--format json`"
+    );
+
+    // `--full` is the switch that does turn it on, listed or not.
+    assert_eq!(
+        collected(SCHEMA_2_WITH_CI_COLUMN, true)["ci"],
+        serde_json::Value::Bool(true),
+        "`--full` should still request CI data for `--format json`"
+    );
+}
+
+const SCHEMA_2_ONLY: &str = r#"[list]
+json-schema = 2
+"#;
+
+const SCHEMA_2_WITH_CI_COLUMN: &str = r#"[list]
+json-schema = 2
+columns = ["branch", "ci"]
+"#;
 
 /// TODO(list-columns-env): `WORKTRUNK__LIST__COLUMNS` is not wired up yet. The
 /// env overlay can only deliver a scalar, which the `Vec<String>` field rejects,

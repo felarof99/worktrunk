@@ -13,7 +13,7 @@
 [![Stars](https://img.shields.io/github/stars/max-sixty/worktrunk?style=for-the-badge&logo=github)](https://github.com/max-sixty/worktrunk/stargazers)
 [![maintained with tend](https://img.shields.io/badge/maintained_with-tend-bba580?style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMCwxNikgc2NhbGUoMC4wMTI1LC0wLjAxMjUpIiBmaWxsPSIjZmZmIiBzdHJva2U9Im5vbmUiPjxwYXRoIGQ9Ik02ODAgMTEyOCBjNjIgLTk2IDY5IC0xNzggMjAgLTI0MSAtMTcgLTIyIC0yMCAtNDAgLTIwIC0xMzQgbDEgLTEwOCAyMSAyOCBjMTEgMTYgMzAgNDcgNDIgNzAgMTIgMjIgMzIgNDkgNDYgNTkgMzcgMjcgMTE0IDM4IDE4NCAyNyA5MyAtMTUgOTQgLTE4IDQ0IC03OSAtNzIgLTg4IC0xMDkgLTExMyAtMTc2IC0xMTcgLTMxIC0yIC02NCAxIC03MiA2IC0yMyAxNSAyMSA1NiAxMDcgOTggNDAgMjAgNzEgMzggNjkgNDAgLTYgNyAtODggLTE3IC0xMjYgLTM3IC00OSAtMjUgLTEwMCAtNzggLTEyMSAtMTI1IC0xNSAtMzMgLTE5IC02NiAtMTkgLTE4OCAwIC0xNTcgOCAtMTk1IDUwIC0yMzIgMTcgLTE2IDM2IC0yMCA4NSAtMTkgNjIgMSA2MyAxIDczIC0zMiA5IC0zMiA5IC0zMyAtMjIgLTQwIC01MCAtMTIgLTEzMiAtNyAtMTY0IDEwIC00MCAyMSAtNzkgNjkgLTkyIDExNCAtNSAyMCAtMTAgMTAyIC0xMCAxODIgMCA4MCAtNSAxNjIgLTExIDE4NCAtMjIgNzkgLTEzNSAxNjYgLTIzNCAxODEgLTM3IDYgLTM1IDMgMzAgLTI4IDc4IC0zOSAxNDQgLTkxIDEzMiAtMTA0IC01IC00IC0zNyAtOCAtNzEgLTggLTc3IDAgLTExNyAyNCAtMTgyIDEwOSAtNTIgNjggLTUxIDcwIDQyIDg1IDcxIDExIDE0MyAwIDE4MyAtMjkgMTYgLTExIDQwIC00MyA1NCAtNzMgMTMgLTI5IDMyIC01OSA0MSAtNjYgMTQgLTEyIDE2IC03IDE2IDU4IDAgNTkgNCA3NyAyMyAxMDIgMTkgMjYgMjMgNDYgMjUgMTMwIDMgNjcgMCA5OSAtNyA5OSAtNyAwIC0xMSAtMjMgLTEyIC01NyAwIC0zMiAtNiAtNzYgLTEyIC05NyBsLTEyIC00MCAtMjcgMzIgYy0zNCA0MSAtNDMgOTYgLTI0IDE1MSAxNCA0MSA3NSAxNDEgODYgMTQxIDMgMCAyMSAtMjQgNDAgLTUyeiIvPjwvZz48L3N2Zz4K)](https://github.com/max-sixty/tend)
 
-> **July 2026**: Worktrunk was [released](https://x.com/max_sixty/status/2006077845391724739?s=20) at the start of the year, and has quickly become the most popular git worktree manager. It's built with love (there's no slop!). Please let me know any frictions at all; I'm intensely focused on continuing to make Worktrunk excellent, and the biggest help is folks posting problems they perceive.
+> **August 2026**: Worktrunk was [released](https://x.com/max_sixty/status/2006077845391724739?s=20) at the start of the year, and has quickly become the most popular git worktree manager. It's built with love (there's no slop!). Please let me know any frictions at all; I'm intensely focused on continuing to make Worktrunk excellent, and the biggest help is folks posting problems they perceive.
 
 Worktrunk is a CLI for git worktree management, designed for running AI agents in parallel.
 
@@ -40,7 +40,7 @@ worktree requires typing the branch name three times: `git worktree add -b feat
 
 ## Worktrunk makes git worktrees as easy as branches
 
-Worktrees are addressed by branch name; paths are computed from a configurable template.
+Worktrees are addressed by branch name; paths are computed from a configurable template. Commands that take a branch also accept the path of the worktree it is checked out in.
 
 > Start with the core commands
 
@@ -131,7 +131,9 @@ winget install max-sixty.worktrunk
 git-wt config shell install
 ```
 
-Alternatively, disable Windows Terminal's alias (Settings → Privacy & security → For developers → App Execution Aliases → disable "Windows Terminal") to use `wt` directly.
+Alternatively, disable Windows Terminal's alias (Settings → Apps → Advanced app settings → App execution aliases → "Terminal"/"Terminal Preview") to use `wt` directly.
+
+> Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/) — [policy](https://worktrunk.dev/code-signing/).
 
 **Arch Linux:**
 
@@ -163,9 +165,9 @@ This creates a new branch and worktree, then switches to it. Do your work, then 
 
 ```console
 $ wt list
-  Branch        Status        HEAD±    main↕     main…±  Remote⇅  Commit    Age   Message
-@ feature-auth  +   ↑      +27   -8   ↑1       +31                4bc72dc9  2h    Add authenticat…
-^ main              ^⇡                                    ⇡1      0e631add  1d    Initial commit
+  Branch        Status        HEAD±    main↕     main…±  Remote⇅  Commit   Age   Message
+@ feature-auth  +   ↑      +27   -8   ↑1       +31                4bc72dc  2h    Add authenticati…
+^ main              ^⇡                                    ⇡1      0e631ad  1d    Initial commit
 
 ○ Showing 2 worktrees, 1 with changes, 1 ahead, 1 column hidden
 
@@ -243,6 +245,21 @@ The `-x` flag runs a command after switching; arguments after `--` are passed to
 
 ### Star history
 
+<!-- `sealed_token` is a GitHub token of ours encrypted with star-history's public
+     key, from "Generate embed code" on star-history.com. Without one the chart
+     renders a "GitHub restricted access to star data" placeholder: GitHub limits
+     stargazer data to a repo's admins and collaborators, and their servers are
+     neither.
+
+     The token is fine-grained and reaches only this repo. Its Contents permission
+     has to be read *and write* — write access is what GitHub accepts as proof of
+     collaborator status, so rotating to a read-only token brings the placeholder
+     straight back. Publishing the ciphertext is safe on its own; what the scope
+     buys is a bound on star-history, which decrypts it and so holds a credential
+     that can push here until it expires 2027-08-16 — at which point the chart
+     reverts to the placeholder with nothing else to signal it. star-history
+     reports GitHub is working on restoring access, so drop this parameter once
+     the plain URL renders a chart again. -->
 <a href="https://star-history.com/#max-sixty/worktrunk&Date">
-  <img src="https://api.star-history.com/svg?repos=max-sixty/worktrunk&type=Date" width="500" alt="Star History Chart">
+  <img src="https://api.star-history.com/svg?repos=max-sixty/worktrunk&type=Date&sealed_token=2ySbQiVbkVrGmwgDsJya-xr4ApbVVvR0siYI46d22Xj_1kPCcgA9X0YpUGc3__aMuZ0ZAWzG4NBhJtqepYjlkoYrVwmKbgaPmGpNZTCfSyVp8EDA_IXaOOYW2whsOXDAi6g7HD9ezsnqSl58n7AqW2_4IQ4hY2p3h7tNv_3k4am5ASq1NdpbfrOUazCl" width="500" alt="Star History Chart">
 </a>
