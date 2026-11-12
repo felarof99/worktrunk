@@ -5,8 +5,11 @@
 //! with an exclusive rename. A failed copy never publishes a complete entry.
 //! Branch names flatten slashes for storage, so lookup also checks the original
 //! branch and repository path in metadata to disambiguate name collisions.
-//! Submodules and opaque ignored directories refuse backup: the parent index
-//! and ignored-file listing cannot reveal all of a nested repository's files.
+//! Empty, uninitialized submodules hold nothing to save. Initialized ones must
+//! be clean, with HEAD pinned by the parent's committed tree or reachable from
+//! a remote-tracking ref, and contain no ignored env files. Nested submodules
+//! follow the same rule. Opaque ignored repositories refuse backup because
+//! their ignored-file listing can hide env files.
 //!
 //! Restore checks every copy destination before applying the combined HEAD
 //! patch. Copies publish without replacing existing files, preserve symlinks,
@@ -122,13 +125,14 @@ fn save_in(
     backup: &BackupResult,
     now: Timestamp,
 ) -> anyhow::Result<Option<AtticEntry>> {
-    reject_submodules(repo, &facts.path)?;
+    ensure_submodules_saved(&facts.path)?;
     let patch = git_bytes(
         repo,
         &facts.path,
         &[
             "diff",
             "--binary",
+            "--unified=3",
             "--no-color",
             "--src-prefix=a/",
             "--dst-prefix=b/",
@@ -382,38 +386,176 @@ fn git_bytes(repo: &Repository, worktree: &Path, args: &[&str]) -> anyhow::Resul
     Ok(output.stdout)
 }
 
-fn reject_submodules(repo: &Repository, worktree: &Path) -> anyhow::Result<()> {
-    let index = git_bytes(repo, worktree, &["ls-files", "--stage", "-z"])?;
-    // Each NUL-delimited record begins with the index mode, before its path.
-    // A clean gitlink can still hide unique ignored .env files, so checking
-    // only changed gitlinks is insufficient. Keep the entire worktree.
-    ensure!(
-        !index
+fn ensure_submodules_saved(worktree: &Path) -> anyhow::Result<()> {
+    let index = submodule_git_bytes(worktree, &["ls-files", "--stage", "-z"])?;
+    let mut committed_tree = None;
+    for entry in index.split(|byte| *byte == 0) {
+        let Some(gitlink) = entry.strip_prefix(b"160000 ") else {
+            continue;
+        };
+        let tab = gitlink
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("Missing submodule path in git index")?;
+        let path_bytes = &gitlink[tab + 1..];
+        let relative = git_path(path_bytes)?;
+        let submodule = worktree.join(&relative);
+        let display = format_path_for_display(&submodule);
+        ensure!(
+            gitlink[..tab].ends_with(b" 0"),
+            "Cannot save submodule @ {display}: unresolved index conflict"
+        );
+        check_parents(worktree, &relative, false)?;
+        match fs::symlink_metadata(&submodule) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect submodule @ {display}"));
+            }
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "Cannot save submodule @ {display}: path contains a file or symlink"
+            ),
+        }
+        match fs::symlink_metadata(submodule.join(".git")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ensure!(
+                    fs::read_dir(&submodule)?.next().transpose()?.is_none(),
+                    "Cannot save submodule @ {display}: uninitialized directory contains files"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect submodule @ {display}"));
+            }
+            Ok(metadata) => ensure!(
+                metadata.is_file() || metadata.is_dir(),
+                "Cannot save submodule @ {display}: .git is not a regular file or directory"
+            ),
+        }
+        let status = submodule_git_bytes(
+            &submodule,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        ensure!(
+            status.is_empty(),
+            "Cannot save submodule @ {display}: uncommitted changes"
+        );
+        let head = submodule_git_bytes(&submodule, &["rev-parse", "--verify", "HEAD"])?;
+        let head = std::str::from_utf8(&head)?.trim();
+        // The index may pin a new local-only commit. Only the committed
+        // parent tree is covered by the parent's remote backup.
+        let tree = match &committed_tree {
+            Some(tree) => tree,
+            None => committed_tree.insert(submodule_git_bytes(
+                worktree,
+                &["ls-tree", "-r", "-z", "HEAD"],
+            )?),
+        };
+        let pinned = tree.split(|byte| *byte == 0).any(|entry| {
+            let Some(record) = entry.strip_prefix(b"160000 commit ") else {
+                return false;
+            };
+            let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                return false;
+            };
+            &record[..tab] == head.as_bytes() && &record[tab + 1..] == path_bytes
+        });
+        if !pinned {
+            let refs = submodule_git_bytes(
+                &submodule,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "--contains",
+                    head,
+                    "refs/remotes/",
+                ],
+            )?;
+            ensure!(
+                !refs.is_empty(),
+                "Cannot save submodule @ {display}: local-only commit {head}"
+            );
+        }
+        let ignored = submodule_git_bytes(
+            &submodule,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?;
+        for bytes in ignored
             .split(|byte| *byte == 0)
-            .any(|entry| entry.starts_with(b"160000 ")),
-        "Cannot save submodule files in an attic patch; preserve submodule work first"
-    );
+            .filter(|bytes| !bytes.is_empty())
+        {
+            let path = git_path(bytes)?;
+            ensure!(
+                !bytes.ends_with(b"/"),
+                "Cannot save submodule @ {display}: ignored repository directory @ {} may contain unsaved env files",
+                format_path_for_display(&path)
+            );
+            ensure!(
+                !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".env")),
+                "Cannot save submodule @ {display}: ignored env file @ {}",
+                format_path_for_display(&path)
+            );
+        }
+        ensure_submodules_saved(&submodule)?;
+    }
     Ok(())
+}
+
+fn submodule_git_bytes(worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    // A submodule has its own index and object store, even when the caller
+    // inherited discovery variables pointing at the parent repository.
+    let output = Cmd::new("git")
+        .args(args.iter().copied())
+        .current_dir(worktree)
+        .scrub_git_discovery_env()
+        .run()
+        .with_context(|| {
+            format!(
+                "Failed to inspect submodule @ {}",
+                format_path_for_display(worktree)
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CommandError::from_failed_output("git", args, &output).into());
+    }
+    Ok(output.stdout)
 }
 
 fn git_paths(repo: &Repository, worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<PathBuf>> {
     git_bytes(repo, worktree, args)?
         .split(|byte| *byte == 0)
         .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
-            }
-            #[cfg(not(unix))]
-            {
-                Ok(PathBuf::from(
-                    std::str::from_utf8(bytes).context("Invalid UTF-8 path from git")?,
-                ))
-            }
-        })
+        .map(git_path)
         .collect()
+}
+
+fn git_path(bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(
+            std::str::from_utf8(bytes).context("Invalid UTF-8 path from git")?,
+        ))
+    }
 }
 
 fn same_file(source: &Path, counterpart: &Path) -> anyhow::Result<bool> {
@@ -738,14 +880,251 @@ mod tests {
     #[test]
     fn tests_that_git_display_settings_cannot_corrupt_the_patch() {
         let mut repo = TestRepo::with_initial_commit();
+        fs::write(
+            repo.path().join("file.txt"),
+            "one\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        repo.run_git(&["commit", "-am", "multiline base"]);
         let path = repo.add_worktree("feature/auth");
         repo.run_git(&["config", "color.ui", "always"]);
         repo.run_git(&["config", "diff.noprefix", "true"]);
-        fs::write(path.join("file.txt"), "saved change").unwrap();
+        repo.run_git(&["config", "diff.context", "0"]);
+        let changed = b"one\ntwo\nsaved change\nfour\nfive\n";
+        fs::write(path.join("file.txt"), changed).unwrap();
         let entry = saved(&repo, &path, "feature/auth", now());
         let dest = repo.add_worktree("restored");
         apply(&entry, &dest).unwrap();
-        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), b"saved change");
+        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), changed);
+    }
+
+    fn submodule_worktree() -> (TestRepo, TestRepo, PathBuf) {
+        let mut repo = TestRepo::with_initial_commit();
+        let source = TestRepo::with_initial_commit();
+        fs::write(source.path().join(".gitignore"), ".env*\n").unwrap();
+        source.run_git(&["add", ".gitignore"]);
+        source.run_git(&["commit", "-m", "ignore env"]);
+        let remote = TestRepo::bare();
+        source.run_git(&[
+            "push",
+            remote.path().to_str().unwrap(),
+            "HEAD:refs/heads/main",
+        ]);
+        repo.run_git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            remote.path().to_str().unwrap(),
+            "sub",
+        ]);
+        repo.run_git(&["commit", "-am", "add submodule"]);
+        let path = repo.add_worktree("feature/auth");
+        (repo, remote, path)
+    }
+
+    fn init_submodule(repo: &TestRepo, path: &Path) {
+        repo.run_git_in(
+            path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+            ],
+        );
+    }
+
+    #[test]
+    fn tests_that_empty_uninitialized_submodules_allow_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        assert!(path.join("sub").is_dir());
+        assert_eq!(fs::read_dir(path.join("sub")).unwrap().count(), 0);
+        fs::write(path.join("notes.txt"), "parent work").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert_eq!(
+            fs::read(entry.path.join("untracked/notes.txt")).unwrap(),
+            b"parent work"
+        );
+    }
+
+    #[test]
+    fn tests_that_missing_uninitialized_submodules_allow_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        fs::remove_dir(path.join("sub")).unwrap();
+        fs::write(path.join("notes.txt"), "parent work").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert_eq!(
+            fs::read(entry.path.join("untracked/notes.txt")).unwrap(),
+            b"parent work"
+        );
+    }
+
+    #[test]
+    fn tests_that_clean_pinned_submodules_allow_saving_without_remote_refs() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        repo.run_git_in(&path.join("sub"), &["remote", "remove", "origin"]);
+        fs::write(path.join("notes.txt"), "parent work").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert_eq!(
+            fs::read(entry.path.join("untracked/notes.txt")).unwrap(),
+            b"parent work"
+        );
+    }
+
+    #[test]
+    fn tests_that_submodule_commits_reachable_from_remote_refs_allow_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        let sub = path.join("sub");
+        repo.run_git_in(&sub, &["commit", "--allow-empty", "-m", "remote ancestor"]);
+        repo.run_git_in(&sub, &["commit", "--allow-empty", "-m", "remote tip"]);
+        repo.run_git_in(&sub, &["push", "origin", "HEAD:refs/heads/published"]);
+        repo.run_git_in(&sub, &["checkout", "HEAD~"]);
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert!(
+            !fs::read(entry.path.join("tracked.patch"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tests_that_submodule_local_only_commits_prevent_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        repo.run_git_in(
+            &path.join("sub"),
+            &["commit", "--allow-empty", "-m", "local only"],
+        );
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("local-only commit"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_staging_a_local_only_submodule_commit_does_not_preserve_it() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        repo.run_git_in(
+            &path.join("sub"),
+            &["commit", "--allow-empty", "-m", "local only"],
+        );
+        repo.run_git_in(&path, &["add", "sub"]);
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("local-only commit"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_nested_submodule_env_files_prevent_saving() {
+        let (repo, remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        let sub = path.join("sub");
+        repo.run_git_in(
+            &sub,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                remote.path().to_str().unwrap(),
+                "nested",
+            ],
+        );
+        repo.run_git_in(&sub, &["commit", "-am", "add nested submodule"]);
+        repo.run_git_in(&path, &["commit", "-am", "pin nested submodule"]);
+        fs::write(sub.join("nested/.env.local"), "nested secret").unwrap();
+        assert!(
+            facts(&repo, &path, "feature/auth")
+                .status_porcelain
+                .is_empty()
+        );
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub/nested") && error.contains("ignored env file"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_submodule_status_settings_cannot_hide_untracked_files() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        let sub = path.join("sub");
+        repo.run_git_in(&sub, &["config", "status.showUntrackedFiles", "no"]);
+        fs::write(sub.join("notes.txt"), "unsaved work").unwrap();
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("uncommitted changes"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_uninitialized_submodule_contents_prevent_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        fs::write(path.join("sub/notes.txt"), "unsaved work").unwrap();
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("uninitialized directory contains files"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+        assert_eq!(
+            fs::read(path.join("sub/notes.txt")).unwrap(),
+            b"unsaved work"
+        );
     }
 
     #[test]
@@ -773,9 +1152,10 @@ mod tests {
             &BackupResult::OnRemote,
             now(),
         );
+        let error = result.unwrap_err().to_string();
         assert!(
-            result.is_err(),
-            "A gitlink patch cannot preserve the submodule's dirty files"
+            error.contains("sub") && error.contains("uncommitted changes"),
+            "{error}"
         );
         assert!(!root(&repo).exists());
     }
@@ -811,9 +1191,10 @@ mod tests {
             &BackupResult::OnRemote,
             now(),
         );
+        let error = result.unwrap_err().to_string();
         assert!(
-            result.is_err(),
-            "Ignored submodule env data must prevent removal"
+            error.contains("sub") && error.contains("ignored env file"),
+            "{error}"
         );
         assert!(!root(&repo).exists());
         assert_eq!(
