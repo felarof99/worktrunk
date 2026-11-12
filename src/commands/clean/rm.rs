@@ -4,6 +4,10 @@
 //! Waiting and the final deletion gate take fresh observations. Hook selection
 //! is frozen before execution; pre-remove hooks run before the final gate, so
 //! a hook cannot invalidate the backup and still authorize forced deletion.
+//! The gate compares live content with both the initial snapshot and the actual
+//! saved patch/files (including primary env copies omitted from the attic).
+//! File stamps bracket hashing and the slow activity probe: same-status edits
+//! during either interval keep the worktree, even if its bytes are restored.
 //! Synchronous Repository::remove_worktree (the existing Git removal fallback)
 //! retains Git's lock/submodule/error checks at the original path, without the
 //! trash staging fast path moving the folder before Git can reject removal.
@@ -15,10 +19,11 @@
 //! inherit waiter mode. Background hooks use read-only approvals unless -y
 //! was supplied. Every actual deletion still goes through remove_one.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use color_print::cformat;
@@ -272,7 +277,7 @@ pub fn remove_one(
         return Ok(row);
     }
     let mut row = row_for(repo, &facts.path, facts.branch.clone())?;
-    let content = match content_signature(facts) {
+    let content = match content_snapshot(facts, ContentSource::Worktree) {
         Ok(content) => content,
         Err(error) => {
             row.reason = format!("backup failed ({})", error_reason(error)?);
@@ -331,7 +336,7 @@ pub fn remove_one(
         row.reason = DEFERRED.into();
         return Ok(row);
     }
-    let result = delete_backed_up(repo, facts, verdict, options, now, &content, &mut row);
+    let result = delete_backed_up(repo, facts, verdict, options, now, &content.hash, &mut row);
     if let Err(error) = result {
         row.reason = error_reason(error)?;
     }
@@ -352,11 +357,103 @@ fn git_bytes(path: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+enum ContentSource<'a> {
+    Worktree,
+    Backup {
+        attic: Option<&'a Path>,
+        primary: &'a Path,
+    },
+}
+
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    kind: fs::FileType,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64, u32),
+}
+
+fn file_stamp(path: &Path) -> std::io::Result<Option<FileStamp>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(FileStamp {
+        kind: metadata.file_type(),
+        len: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.mode(),
+            )
+        },
+    }))
+}
+
+struct ContentSnapshot {
+    hash: [u8; 32],
+    stamps: BTreeMap<PathBuf, Option<FileStamp>>,
+}
+
+impl ContentSnapshot {
+    fn unchanged(&self) -> bool {
+        self.stamps
+            .iter()
+            .all(|(path, stamp)| file_stamp(path).is_ok_and(|current| current == *stamp))
+    }
+}
+
+fn watch_path(
+    stamps: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+    path: &Path,
+    root: &Path,
+) -> anyhow::Result<()> {
+    for ancestor in path.ancestors() {
+        if let std::collections::btree_map::Entry::Vacant(entry) = stamps.entry(ancestor.into()) {
+            entry.insert(file_stamp(ancestor)?);
+        }
+        if ancestor == root {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn git_path(name: &[u8]) -> anyhow::Result<&Path> {
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(name))
+    };
+    #[cfg(not(unix))]
+    let path = Path::new(std::str::from_utf8(name)?);
+    anyhow::ensure!(
+        path.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Invalid backup file path"
+    );
+    Ok(path)
+}
+
 /// Porcelain names states, not contents: M stays M across an edit, and ?? dir/
-/// hides additions inside that directory. Hash exactly the content the attic
-/// preserves, including ignored env files, before backup and after hooks.
-/// Stream loose files so a large untracked file needs bounded memory.
-fn content_signature(facts: &WorktreeFacts) -> anyhow::Result<[u8; 32]> {
+/// hides additions inside that directory. Hash the attic's canonical patch and
+/// loose-file contents; saved snapshots substitute the actual preserved files.
+/// Keep stamps for a cheap recheck after activity inspection, so large loose
+/// files need no second read between the busy gate and deletion.
+fn content_snapshot(
+    facts: &WorktreeFacts,
+    source: ContentSource<'_>,
+) -> anyhow::Result<ContentSnapshot> {
+    let mut stamps = BTreeMap::new();
+    watch_path(&mut stamps, &facts.path, &facts.path)?;
     let head = git_bytes(&facts.path, &["rev-parse", "--verify", "HEAD"])?;
     let status = git_bytes(&facts.path, &["status", "--porcelain"])?;
     anyhow::ensure!(
@@ -364,18 +461,42 @@ fn content_signature(facts: &WorktreeFacts) -> anyhow::Result<[u8; 32]> {
         "changed during backup"
     );
     let mut hash = Sha256::new();
-    let patch = git_bytes(
-        &facts.path,
-        &[
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--ignore-submodules=none",
-            "HEAD",
-            "--",
-        ],
-    )?;
+    let patch = match source {
+        ContentSource::Worktree => {
+            let tracked = git_bytes(&facts.path, &["ls-files", "--cached", "-z"])?;
+            for name in tracked
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+            {
+                watch_path(&mut stamps, &facts.path.join(git_path(name)?), &facts.path)?;
+            }
+            git_bytes(
+                &facts.path,
+                &[
+                    "diff",
+                    "--binary",
+                    "--unified=3",
+                    "--no-color",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=none",
+                    "--submodule=short",
+                    "HEAD",
+                    "--",
+                ],
+            )?
+        }
+        ContentSource::Backup {
+            attic: Some(attic), ..
+        } => {
+            let path = attic.join("tracked.patch");
+            watch_path(&mut stamps, &path, attic)?;
+            fs::read(path).context("changed during backup")?
+        }
+        ContentSource::Backup { attic: None, .. } => Vec::new(),
+    };
     hash.update((patch.len() as u64).to_le_bytes());
     hash.update(patch);
     for ignored in [false, true] {
@@ -388,13 +509,15 @@ fn content_signature(facts: &WorktreeFacts) -> anyhow::Result<[u8; 32]> {
             .split(|byte| *byte == 0)
             .filter(|name| !name.is_empty())
         {
-            #[cfg(unix)]
-            let path = {
-                use std::os::unix::ffi::OsStrExt;
-                Path::new(std::ffi::OsStr::from_bytes(name))
-            };
-            #[cfg(not(unix))]
-            let path = Path::new(std::str::from_utf8(name)?);
+            let path = git_path(name)?;
+            // Directory stamps also catch additions beneath collapsed ?? dirs
+            // and new env files among otherwise ignored build outputs.
+            let live = facts.path.join(path);
+            watch_path(
+                &mut stamps,
+                live.parent().context("Missing backup file parent")?,
+                &facts.path,
+            )?;
             if ignored
                 && !path
                     .file_name()
@@ -402,14 +525,26 @@ fn content_signature(facts: &WorktreeFacts) -> anyhow::Result<[u8; 32]> {
             {
                 continue;
             }
-            anyhow::ensure!(
-                path.components()
-                    .all(|component| matches!(component, std::path::Component::Normal(_))),
-                "Invalid backup file path"
-            );
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name);
-            let path = facts.path.join(path);
+            let (path, root) = match source {
+                ContentSource::Worktree => (live, facts.path.as_path()),
+                ContentSource::Backup { attic, primary } => {
+                    let saved = attic.map(|attic| {
+                        attic
+                            .join(if ignored { "ignored-env" } else { "untracked" })
+                            .join(path)
+                    });
+                    match saved {
+                        Some(saved) if fs::symlink_metadata(&saved).is_ok() => {
+                            (saved, attic.context("Missing attic path")?)
+                        }
+                        _ if ignored => (primary.join(path), primary),
+                        _ => anyhow::bail!("changed during backup"),
+                    }
+                }
+            };
+            watch_path(&mut stamps, &path, root)?;
             let metadata = fs::symlink_metadata(&path)?;
             hash.update(metadata.len().to_le_bytes());
             #[cfg(unix)]
@@ -433,7 +568,12 @@ fn content_signature(facts: &WorktreeFacts) -> anyhow::Result<[u8; 32]> {
             }
         }
     }
-    Ok(hash.finalize().into())
+    let snapshot = ContentSnapshot {
+        hash: hash.finalize().into(),
+        stamps,
+    };
+    anyhow::ensure!(snapshot.unchanged(), "changed during backup");
+    Ok(snapshot)
 }
 
 fn approve_hooks(
@@ -501,14 +641,20 @@ fn delete_backed_up(
     if let Verdict::Remove { terminals } = verdict {
         terminals::end(terminals)?;
     }
-    // Hashing can take time for large files. Do it before the fresh activity
-    // and HEAD/status gate, so it cannot stretch that gate's race window.
-    let unchanged_content = content_signature(facts)? == *content;
+    let live = content_snapshot(facts, ContentSource::Worktree)?;
+    let saved = content_snapshot(
+        facts,
+        ContentSource::Backup {
+            attic: row.attic.as_deref(),
+            primary: &primary,
+        },
+    )?;
     let fresh = observe(&stable, &facts.path)?;
     if fresh.tip_sha != facts.tip_sha
         || fresh.status_porcelain != facts.status_porcelain
         || fresh.branch != facts.branch
-        || !unchanged_content
+        || live.hash != *content
+        || saved.hash != *content
         || (is_waiter() && fresh.last_touch > facts.last_touch)
     {
         row.reason = "changed during backup".into();
@@ -567,6 +713,12 @@ fn delete_backed_up(
         ])?;
     }
     worktrunk::git::remove::stop_fsmonitor_daemon(&stable.worktree_at(&facts.path));
+    // No slow probe or content read between this stamp check and removal.
+    // A write during hashing, hooks or activity inspection keeps the folder.
+    anyhow::ensure!(
+        live.unchanged() && saved.unchanged(),
+        "changed during backup"
+    );
     stable.remove_worktree(&facts.path, true)?;
     row.verdict = OutputVerdict::Removed;
     row.reason = "backed up".into();

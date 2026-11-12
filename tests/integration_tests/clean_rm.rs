@@ -86,6 +86,27 @@ impl Fixture {
         fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    fn on_second_activity_probe(&self, body: &str) {
+        let hc = self.bin.join("hc");
+        fs::remove_file(&hc).unwrap(); // Replace the fake tool's symlink, never its binary.
+        fs::write(
+            &hc,
+            format!(
+                r#"#!/bin/sh
+if [ -f {} ]; then
+    {body}
+fi
+touch {}
+printf '%s\n' '{{"terminals":[]}}'
+"#,
+                quote(&self.bin.join("observed")),
+                quote(&self.bin.join("observed"))
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(hc, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     fn project(&self, body: &str) {
         fs::create_dir_all(self.repo.path().join(".config")).unwrap();
         fs::write(self.repo.path().join(".config/wt.toml"), body).unwrap();
@@ -471,6 +492,64 @@ fn tests_that_clean_rm_keeps_edits_even_when_porcelain_does_not_change() {
         assert_eq!(rows[0]["reason"], "changed during backup");
         assert_eq!(fs::read_to_string(file).unwrap(), "after");
         assert!(f.exists_branch());
+    }
+}
+
+#[test]
+fn tests_that_clean_rm_checks_the_bytes_actually_saved_to_the_attic() {
+    for name in ["file.txt", "folder/local", ".env.local"] {
+        let f = Fixture::new();
+        f.unique_commit();
+        fs::write(f.repo.path().join(".git/info/exclude"), ".env*\n").unwrap();
+        let path = f.path.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "original").unwrap();
+        f.hook(&format!("printf different > {}", quote(&path)));
+        f.project(&format!("pre-remove = 'printf original > {name}'\n"));
+        let rows = f.json(&["feature", "-y"], 1);
+        assert_eq!(rows[0]["verdict"], "kept");
+        assert_eq!(rows[0]["reason"], "changed during backup");
+        assert_eq!(fs::read_to_string(path).unwrap(), "original");
+    }
+}
+
+#[test]
+fn tests_that_clean_rm_rechecks_primary_env_copies_omitted_from_attic() {
+    for during_probe in [false, true] {
+        let f = Fixture::new();
+        fs::write(f.repo.path().join(".git/info/exclude"), ".env*\n").unwrap();
+        fs::write(f.path.join(".env.local"), "original").unwrap();
+        let primary_env = f.repo.path().join(".env.local");
+        fs::write(&primary_env, "original").unwrap();
+        if during_probe {
+            f.on_second_activity_probe(&format!("printf different > {}", quote(&primary_env)));
+        } else {
+            f.project(&format!(
+                "pre-remove = 'printf different > {}'\n",
+                primary_env.display()
+            ));
+        }
+        let rows = f.json(&["feature", "-y"], 1);
+        assert_eq!(rows[0]["reason"], "changed during backup");
+        assert_eq!(
+            fs::read_to_string(f.path.join(".env.local")).unwrap(),
+            "original"
+        );
+    }
+}
+
+#[test]
+fn tests_that_clean_rm_keeps_edits_made_during_the_final_activity_probe() {
+    for name in ["file.txt", "folder/local", ".env.local"] {
+        let f = Fixture::new();
+        fs::write(f.repo.path().join(".git/info/exclude"), ".env*\n").unwrap();
+        let path = f.path.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "original").unwrap();
+        f.on_second_activity_probe(&format!("printf different > {}", quote(&path)));
+        let rows = f.json(&["feature"], 1);
+        assert_eq!(rows[0]["reason"], "changed during backup");
+        assert_eq!(fs::read_to_string(path).unwrap(), "different");
     }
 }
 
