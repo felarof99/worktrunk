@@ -5,7 +5,8 @@
 //! with an exclusive rename. A failed copy never publishes a complete entry.
 //! Branch names flatten slashes for storage, so lookup also checks the original
 //! branch and repository path in metadata to disambiguate name collisions.
-//! Changed submodules refuse backup: a gitlink patch cannot hold their files.
+//! Submodules and opaque ignored directories refuse backup: the parent index
+//! and ignored-file listing cannot reveal all of a nested repository's files.
 //!
 //! Restore checks every copy destination before applying the combined HEAD
 //! patch. Copies publish without replacing existing files, preserve symlinks,
@@ -121,7 +122,7 @@ fn save_in(
     backup: &BackupResult,
     now: Timestamp,
 ) -> anyhow::Result<Option<AtticEntry>> {
-    reject_changed_submodules(repo, &facts.path)?;
+    reject_submodules(repo, &facts.path)?;
     let patch = git_bytes(
         repo,
         &facts.path,
@@ -156,6 +157,14 @@ fn save_in(
     let primary = repo.primary_worktree()?;
     let mut env_files = Vec::new();
     for relative in ignored {
+        // ls-files reports an ignored nested repository as "directory/",
+        // without its files. Filtering that basename would silently lose env
+        // files hidden inside it. Ordinary ignored directories are expanded.
+        ensure!(
+            !relative.as_os_str().as_encoded_bytes().ends_with(b"/"),
+            "Cannot save ignored repository directory @ {}; preserve nested repository work first",
+            format_path_for_display(&facts.path.join(&relative))
+        );
         if !relative
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with(".env"))
@@ -373,35 +382,17 @@ fn git_bytes(repo: &Repository, worktree: &Path, args: &[&str]) -> anyhow::Resul
     Ok(output.stdout)
 }
 
-fn reject_changed_submodules(repo: &Repository, worktree: &Path) -> anyhow::Result<()> {
-    let changes = git_bytes(
-        repo,
-        worktree,
-        &[
-            "diff",
-            "--raw",
-            "-z",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--ignore-submodules=none",
-            "HEAD",
-            "--",
-        ],
-    )?;
-    // With -z and --no-renames, each raw record is a header followed by one
-    // path. Inspect modes only in headers, never in arbitrary file names.
-    let mut fields = changes.split(|byte| *byte == 0);
-    while let Some(header) = fields.next().filter(|header| !header.is_empty()) {
-        let mut modes = header.split(|byte| *byte == b' ');
-        let old = modes.next();
-        let new = modes.next();
-        ensure!(
-            old != Some(b":160000".as_slice()) && new != Some(b"160000".as_slice()),
-            "Cannot save changed submodule files in an attic patch; preserve submodule work first"
-        );
-        fields.next().context("Incomplete raw diff record")?;
-    }
+fn reject_submodules(repo: &Repository, worktree: &Path) -> anyhow::Result<()> {
+    let index = git_bytes(repo, worktree, &["ls-files", "--stage", "-z"])?;
+    // Each NUL-delimited record begins with the index mode, before its path.
+    // A clean gitlink can still hide unique ignored .env files, so checking
+    // only changed gitlinks is insufficient. Keep the entire worktree.
+    ensure!(
+        !index
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"160000 ")),
+        "Cannot save submodule files in an attic patch; preserve submodule work first"
+    );
     Ok(())
 }
 
@@ -787,6 +778,95 @@ mod tests {
             "A gitlink patch cannot preserve the submodule's dirty files"
         );
         assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_clean_submodules_cannot_hide_ignored_env_files_from_backup() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        let submodule = TestRepo::with_initial_commit();
+        fs::write(submodule.path().join(".gitignore"), ".env*\n").unwrap();
+        submodule.run_git(&["add", ".gitignore"]);
+        submodule.run_git(&["commit", "-m", "ignore env"]);
+        repo.run_git_in(
+            &path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule.path().to_str().unwrap(),
+                "sub",
+            ],
+        );
+        repo.run_git_in(&path, &["commit", "-am", "add submodule"]);
+        fs::write(path.join("sub/.env.local"), "local secret").unwrap();
+        assert!(!repo.path().join("sub/.env.local").exists());
+        let facts = facts(&repo, &path, "feature/auth");
+        assert!(facts.status_porcelain.is_empty());
+        let result = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts,
+            &BackupResult::OnRemote,
+            now(),
+        );
+        assert!(
+            result.is_err(),
+            "Ignored submodule env data must prevent removal"
+        );
+        assert!(!root(&repo).exists());
+        assert_eq!(
+            fs::read(path.join("sub/.env.local")).unwrap(),
+            b"local secret"
+        );
+    }
+
+    #[test]
+    fn tests_that_ignored_nested_repositories_cannot_hide_env_files_from_backup() {
+        let mut repo = TestRepo::with_initial_commit();
+        fs::write(repo.path().join(".gitignore"), "ignored/\n").unwrap();
+        repo.run_git(&["add", ".gitignore"]);
+        repo.run_git(&["commit", "-m", "ignore nested repo"]);
+        let path = repo.add_worktree("feature/auth");
+        let nested = path.join("ignored");
+        repo.run_git(&["init", "-b", "main", nested.to_str().unwrap()]);
+        repo.run_git_in(&nested, &["commit", "--allow-empty", "-m", "nested base"]);
+        fs::write(nested.join(".env.local"), "local secret").unwrap();
+        assert!(!repo.path().join("ignored/.env.local").exists());
+        let facts = facts(&repo, &path, "feature/auth");
+        assert!(facts.status_porcelain.is_empty());
+        assert_eq!(
+            git_paths(
+                &repo.repo,
+                &path,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z"
+                ]
+            )
+            .unwrap(),
+            vec![PathBuf::from("ignored/")]
+        );
+        let result = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts,
+            &BackupResult::OnRemote,
+            now(),
+        );
+        assert!(
+            result.is_err(),
+            "Ignored nested env data must prevent removal"
+        );
+        assert!(!root(&repo).exists());
+        assert_eq!(
+            fs::read(nested.join(".env.local")).unwrap(),
+            b"local secret"
+        );
     }
 
     #[test]
