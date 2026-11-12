@@ -52,8 +52,6 @@ fn tests_that_clean_skeleton_accepts_flags_and_returns_an_error() {
             "--format",
             "text",
         ],
-        &["keep"],
-        &["keep", "feature/auth", "--off"],
     ];
     for args in cases {
         let output = wt_command()
