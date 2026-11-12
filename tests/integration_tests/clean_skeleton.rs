@@ -25,39 +25,6 @@ fn tests_that_clean_help_is_available() {
     }
 }
 
-#[test]
-fn tests_that_clean_skeleton_accepts_flags_and_returns_an_error() {
-    // Replace this skeleton-only contract as pieces C–F implement the handlers.
-    let cases: &[&[&str]] = &[
-        &["rm"],
-        &["rm", "feature/auth", "--wait", "5s"],
-        &[
-            "rm",
-            "feature/auth",
-            "fix",
-            "--after",
-            "1h",
-            "--dry-run",
-            "--format",
-            "json",
-        ],
-    ];
-    for args in cases {
-        let output = wt_command()
-            .args(["-C", ".", "-y", "clean"])
-            .args(*args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1), "clean {args:?}: {output:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("wt clean {} is not implemented yet", args[0])),
-            "clean {args:?}: {stderr}"
-        );
-        assert!(output.stdout.is_empty(), "clean {args:?}: {output:?}");
-    }
-}
-
 #[rstest]
 fn tests_that_clean_completes_commands_and_branches(mut repo: TestRepo) {
     repo.add_worktree("feature/auth");
