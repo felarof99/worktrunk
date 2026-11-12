@@ -1,0 +1,118 @@
+---
+source: tests/integration_tests/help.rs
+info:
+  program: wt
+  args:
+    - clean
+    - "--help"
+  env:
+    CLICOLOR_FORCE: "1"
+    COLUMNS: "500"
+    GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
+    LANG: C
+    LC_ALL: C
+    LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
+    TERM: alacritty
+    WORKTRUNK_APPROVALS_PATH: "[TEST_APPROVALS]"
+    WORKTRUNK_CONFIG_PATH: "[TEST_CONFIG]"
+    WORKTRUNK_SYSTEM_CONFIG_PATH: "[TEST_SYSTEM_CONFIG]"
+    WORKTRUNK_TEST_BASH_INSTALLED: "0"
+    WORKTRUNK_TEST_CLAUDE_INSTALLED: "0"
+    WORKTRUNK_TEST_CODEX_INSTALLED: "0"
+    WORKTRUNK_TEST_DELAYED_STREAM_MS: "-1"
+    WORKTRUNK_TEST_EPOCH: "1735776000"
+    WORKTRUNK_TEST_FISH_INSTALLED: "0"
+    WORKTRUNK_TEST_GEMINI_INSTALLED: "0"
+    WORKTRUNK_TEST_NUSHELL_ENV: "0"
+    WORKTRUNK_TEST_OPENCODE_INSTALLED: "0"
+    WORKTRUNK_TEST_PARENT_SHELL: ""
+    WORKTRUNK_TEST_POWERSHELL_ENV: "0"
+    WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
+    WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
+    WORKTRUNK_TEST_ZSH_INSTALLED: "0"
+---
+success: true
+exit_code: 0
+----- stdout -----
+wt clean - Back up and clean worktrees
+
+Usage: [1m[36mwt clean[0m [36m[OPTIONS][0m [36m<COMMAND>[0m
+
+[1m[32mCommands:[0m
+  [1m[36mrm[0m       Back up and remove worktrees
+  [1m[36msweep[0m    Back up and remove inactive worktrees
+  [1m[36mkeep[0m     Pin a worktree against cleanup
+  [1m[36mrestore[0m  Recreate a worktree from backup
+
+[1m[32mOptions:[0m
+  [1m[36m-h[0m, [1m[36m--help[0m
+          Print help (see a summary with '-h')
+
+[1m[32mGlobal Options:[0m
+  [1m[36m-C[0m[36m [0m[36m<path>[0m
+          Working directory for this command
+
+      [1m[36m--config[0m[36m [0m[36m<path>[0m
+          User config file path
+
+      [1m[36m--config-set[0m[36m [0m[36m<toml>[0m
+          Override config with inline TOML, e.g. --config-set list.full=true (repeatable)
+
+  [1m[36m-v[0m, [1m[36m--verbose[0m[36m...[0m
+          Verbose output (-v: info logs + hook/alias template variables on stderr; -vv: also debug logs and raw subprocess output written to .git/wt/logs/). Set WORKTRUNK_VERBOSE=0|1|2 to apply the same level everywhere — including shell completion, which no flag can reach
+
+  [1m[36m-y[0m, [1m[36m--yes[0m
+          Skip approval prompts
+
+Commits are confirmed on the primary remote before removal. Uncommitted work is saved locally; ignored build output is discarded.
+
+[1m[32mExamples[0m
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--after[0m[2m 10m[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--wait[0m[2m 5s[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--dry-run[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--all-repos[0m[2m [0m[2m[36m--root[0m[2m ~/code [0m[2m[36m--format[0m[2m json[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean keep feature/auth[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean keep feature/auth [0m[2m[36m--off[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean restore feature/auth[0m
+
+[1m[32mWorktrees and backups[0m
+
+Worktrees are addressed by branch name, with the worktree's own path as an alias resolved after the branch. Omitting BRANCH selects the current worktree where the argument is optional.
+
+Before any removal, commits must be confirmed on the primary remote. Missing commits are pushed to [2mwt-backup/<branch>[0m; detached heads use [2mwt-backup/detached-<worktree folder name>-<first 12 tip SHA characters>[0m. Tracked changes, untracked files, and differing ignored [2m.env*[0m files are saved locally under [2m~/.wt-attic/[0m and never uploaded. Other ignored content, including nested repositories under ignored paths, is discarded. Only [2m.env*[0m files Git can list in the worktree itself are saved. Untracked 
+repositories and submodules with unsaved work prevent removal. A missing remote, failed backup, or worktree changed during backup prevents removal.
+
+Primary and pinned worktrees are kept. Locks are respected except factory locks whose reasons start with [2mhc factory run[0m or [2mherdr-factory run[0m. Removal hooks follow the same approval rules as [2mwt remove[0m.
+
+[1m[32mPreview and JSON[0m
+
+[2mrm[0m and [2msweep[0m accept [2m--dry-run[0m: print verdicts and reasons without changing anything. A preview checks file contents, attic safety, submodules, locks, and remote backup status. It may query the remote with [2mls-remote[0m, but never pushes or runs hooks. A [2mwould-remove[0m verdict describes the current checks; a later write, hook, or push can still fail. It does not wait for [2m--wait[0m or start a job for [2m--after[0m.
+
+[2m--format json[0m prints one array. Each item has [2mrepo[0m, [2mbranch[0m (null for detached HEAD), [2mpath[0m, [2mverdict[0m ([2mremoved[0m, [2mkept[0m, [2mdeferred[0m, or [2mwould-remove[0m), [2mreason[0m, [2mbackup[0m ([2mon-remote[0m, the pushed ref, or null), and [2mattic[0m (path or null). In a preview, [2mbackup[0m is [2mon-remote[0m if the tip is already there; otherwise it is null and [2mreason[0m names the ref that would be pushed.
+
+[1m[32mStored files[0m
+
+                            Location                                                          Contents                              
+ ─────────────────────────────────────────────────────────────── ────────────────────────────────────────────────────────────────── 
+ [2m~/.wt-attic/<repo>/<branch, slashes as dashes>/<UTC timestamp>/[0m [2mtracked.patch[0m, [2muntracked/[0m, [2mignored-env/[0m, and [2mmeta.json[0m; local only 
+ Beside user config: [2mclean-repositories.json[0m                     Repositories visited by clean commands, except dry runs            
+ Beside user config: [2mclean-terminal-history.json[0m                 Terminal turns and the last time each changed                      
+ [2m.git/wt/clean/<unique-id>/marks.json[0m                            Pins and remove-requested marks                                    
+ Each worktree admin directory: [2mwt/clean-id.json[0m                 Pointer to that worktree's marks                                   
+ [2m.git/wt/logs/clean.jsonl[0m                                        Removal results and skipped or failed delayed requests             
+
+Registry and mark updates use sibling lock files. Delayed-job output and remove-hook output use the usual per-branch logs under [2m.git/wt/logs/[0m. Sweeps expire attic entries at least 30 days old. Backed-up commits stay on the remote.
+
+[2mrm[0m exits 0 when every request succeeds or is deferred, 1 on a refusal or failure. [2msweep[0m exits 0 even when individual worktrees are kept; failures of the sweep itself exit 1. [2mkeep[0m and [2mrestore[0m exit 0 on success, 1 on failure. Invalid arguments exit 2.
+
+----- stderr -----

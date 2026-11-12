@@ -138,7 +138,7 @@ Fish and Nushell wrappers live at a path named after the command, so install wri
 
 ### 4. Metadata in `.git/` (automatic)
 
-Worktrunk stores small amounts of cache and log data in the repository's `.git/` directory:
+Worktrunk stores cache and log data in the repository's `.git/` directory:
 
 | Location | Purpose | Created by |
 |----------|---------|------------|
@@ -155,18 +155,37 @@ Worktrunk stores small amounts of cache and log data in the repository's `.git/`
 
 None of this is tracked by git or pushed to remotes.
 
-**To remove:** `wt config state clear` removes all worktrunk data — config keys, caches, markers, hints, variables, logs, and stale trash.
+**To remove:** `wt config state clear` removes config keys, caches, markers, hints, variables, logs, and stale trash. Cleanup marks are described below.
+
+### 5. Cleanup backups and state
+
+`wt clean rm` and `wt clean sweep` confirm commits on the primary remote before deletion. Unpublished tips are pushed to `refs/heads/wt-backup/<branch>`. Detached tips use `wt-backup/detached-<worktree folder name>-<first 12 tip SHA characters>`.
+
+| Location | Contents |
+|---|---|
+| `~/.wt-attic/<repo>/<branch, slashes as dashes>/<UTC timestamp>/` | Tracked patch, untracked files, differing ignored `.env*` files, and metadata; never uploaded |
+| Beside user config: `clean-repositories.json` | Repositories visited by clean commands |
+| Beside user config: `clean-terminal-history.json` | Terminal turn history used by the 7-day rule |
+| `.git/wt/clean/<unique-id>/marks.json` | Pins and remove-requested marks, with a sibling lock file |
+| Each worktree admin directory: `wt/clean-id.json` | Pointer to that worktree's marks |
+| `.git/wt/logs/clean.jsonl` | Removal results and skipped or failed delayed requests |
+
+Registry updates also use a sibling lock file. Delayed jobs and remove hooks write to the usual per-branch logs. Dry runs create none of these files.
+
+`wt clean restore <branch>` recreates the worktree and applies its newest attic entry without consuming it. Sweeps expire attic entries at least 30 days old. `wt clean keep <branch> --off` clears a pin; cleanup marks and user-level registry/history are separate from `wt config state clear`.
 
 ### What Worktrunk does NOT create
 
-- No files outside `.git/`, config directories, or worktree directories
+- No files outside `.git/`, config directories, worktree directories, or `~/.wt-attic/`
 - No global git hooks
 - No modifications to `~/.gitconfig`
-- No long-running background processes or daemons
+- No continuous cleanup daemon; `wt clean rm --after` starts a one-shot waiter
 
 ## What can Worktrunk delete?
 
 Worktrunk can delete **worktrees** and **branches**. Both have safeguards.
+
+`wt clean rm` and `wt clean sweep` remove worktrees and local branches only after confirming commits on the primary remote and saving uncommitted work locally. Sweeps also expire attic entries at least 30 days old. PR merge status does not affect cleanup.
 
 ### Worktree removal
 
@@ -182,6 +201,16 @@ git worktree lock ../myproject.feature --reason "Contains local database"
 
 Locked worktrees show `⊞` in `wt list`. Neither `git worktree remove` nor `wt remove` (even with `--force`) will delete them. Unlock with `git worktree unlock`.
 
+### Backed-up cleanup
+
+`wt clean rm` refuses primary and pinned worktrees. A busy worktree is backed up and marked for a later sweep. `--wait` waits briefly for activity to end; `--after` schedules a detached attempt that keeps the worktree if it was touched or remains busy.
+
+`wt clean sweep` keeps primary worktrees, bare repositories, and pins. It removes worktrees silent for at least 7 days after ending their non-working hc terminals. Otherwise it keeps busy worktrees, removes earlier `rm` requests, and removes worktrees untouched for at least 24 hours. Unknown activity keeps the worktree.
+
+Both commands save tracked changes, untracked files, and differing ignored `.env*` files Git lists in the worktree. Other ignored content is discarded, including nested repositories under ignored paths such as build fixtures in `target/`. Nested repositories in untracked paths still prevent removal. Submodules with unsaved changes, local-only commits, or ignored env files also prevent removal.
+
+Missing remotes, failed backups, content changes during backup, and non-factory locks keep the worktree. Only locks whose reasons start with `hc factory run` or `herdr-factory run` are unlocked automatically. Approved remove hooks run as with `wt remove`. `--dry-run` checks the same read-only safety gates and prints the remote backup status without writes, pushes, hooks, or terminal termination.
+
 ### Branch deletion
 
 By default, `wt remove` only deletes branches whose content is already in the default branch. Branches showing `_` (same commit) or `⊂` (integrated) in `wt list` are safe to delete.
@@ -196,7 +225,7 @@ A branch checked out in a second worktree is retained regardless, `-D` included.
 
 - `wt merge` / `wt step push` — the target branch's checked-out worktree is updated to the merged commits, so a file those commits delete disappears from it, and an ignored file at a path they track is overwritten — the same result a `git merge` run in that worktree would produce. Uncommitted changes at paths the merge doesn't touch stay in place, staged or not; one at a path it does touch refuses the merge upfront, naming the file
 - `wt remove` — besides the target worktree, two cleanup mechanisms run. The removed worktree's own `git fsmonitor--daemon` (git's per-worktree filesystem watcher under `core.fsmonitor=true`, which would leak once its worktree is gone) is sent `git fsmonitor--daemon stop`, then force-terminated (`SIGTERM`, then `SIGKILL`) via the PID resolved from its IPC socket if it didn't exit. A background sweep then deletes `.git/wt/trash/` entries older than 24 hours (directories orphaned when a previous background removal was interrupted) and terminates fsmonitor daemons whose worktree no longer exists (orphans from `git worktree remove`, `rm -rf`, or a crashed `wt`)
-- `wt config state clear` — removes all worktrunk data from `.git/` (config keys, caches, markers, hints, variables, logs, stale trash)
+- `wt config state clear` — removes config keys, caches, markers, hints, variables, logs, and stale trash from `.git/`; cleanup pins and remove-requested marks remain
 - `wt config shell install` — when migrating an integration to a new location, removes the file left at the old one: fish `conf.d/wt.fish` (now `functions/wt.fish`) and nushell wrappers stranded under `<config-dir>/vendor/autoload` (now `<data-dir>/vendor/autoload`). The old path is where worktrunk's own wrapper lived and is named after the command being installed, so it's taken back whole without reading it — a `conf.d/wt.fish` left in place would be sourced at startup and shadow the new wrapper anyway. Only that exact filename is touched, and each removal is printed
 - `wt config shell uninstall` — removes integration lines from bash/zsh/PowerShell rc files, and deletes worktrunk's wrapper and completion files (fish `functions/`, `conf.d/`, and `completions/`; nushell `vendor/autoload`). Uninstall takes no command name, so it lists those directories and recognizes files by worktrunk's own content markers, whatever binary name they were installed under; files without the markers are left alone. An rc file belongs to the user, so a line qualifies only where it runs the init command: one that merely mentions it, inside a comment, an `echo`, or an alias body, stays. Every line uninstall does take is printed, before removal and again after
 

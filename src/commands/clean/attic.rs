@@ -1,0 +1,1652 @@
+//! Local-only preservation of uncommitted work. Public entry points resolve
+//! HOME (USERPROFILE on Windows); the inner operations take an explicit root.
+//!
+//! Saves build a private `.pending-*` sibling, write metadata last, then publish
+//! with an exclusive rename. A failed copy never publishes a complete entry.
+//! Branch names flatten slashes for storage, so lookup also checks the original
+//! branch and repository path in metadata to disambiguate name collisions.
+//! Empty, uninitialized submodules hold nothing to save. Initialized ones must
+//! be clean, with HEAD pinned by the parent's committed tree or reachable from
+//! a remote-tracking ref, and contain no ignored env files. Nested submodules
+//! follow the same rule. Nested repositories under ignored paths are ignored
+//! content: neither saved nor a reason to refuse removal. Only ignored `.env*`
+//! files Git lists in the worktree itself are saved. Untracked repositories
+//! remain a refusal because a file copy cannot preserve their work faithfully.
+//! Preview and save share the same read-only inventory and destination checks.
+//!
+//! Restore checks every copy destination before applying the combined HEAD
+//! patch. Copies publish without replacing existing files, preserve symlinks,
+//! and refuse symlink directory components. Tracked files must be clean before
+//! patching. Restored tracked changes are staged so gitlinks survive too;
+//! initialized submodule checkouts stay in place until `git submodule update`.
+//! Entries survive both successful and failed restores until expiry.
+//! Expiry walks exactly repo/branch/entry, never follows directory symlinks,
+//! and deletes only directories containing readable, typed metadata.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
+
+use anyhow::{Context, ensure};
+use worktrunk::git::{CommandError, Repository};
+use worktrunk::path::format_path_for_display;
+use worktrunk::shell_exec::Cmd;
+
+use super::{AtticEntry, AtticMetadata, BackupResult, Timestamp, WorktreeFacts};
+
+const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+fn attic_root() -> anyhow::Result<PathBuf> {
+    Ok(home::home_dir()
+        .context("Cannot locate the home directory for the attic")?
+        .join(".wt-attic"))
+}
+
+/// Save uncommitted files locally, publishing only after every copy succeeds.
+pub fn save(
+    repo: &Repository,
+    facts: &WorktreeFacts,
+    backup: &BackupResult,
+    now: Timestamp,
+) -> anyhow::Result<Option<AtticEntry>> {
+    save_in(&attic_root()?, repo, facts, backup, now)
+}
+
+/// Find the newest complete entry matching both the repository and branch.
+pub fn load_latest(repo: &Repository, branch: &str) -> anyhow::Result<Option<AtticEntry>> {
+    load_latest_in(&attic_root()?, repo, branch)
+}
+
+/// Restore the combined patch and saved files without replacing user changes.
+pub fn apply(entry: &AtticEntry, worktree: &Path) -> anyhow::Result<()> {
+    ensure!(is_directory(&entry.path)?, "Attic entry is not a directory");
+    let patch_path = entry.path.join("tracked.patch");
+    ensure!(
+        fs::symlink_metadata(&patch_path)?.is_file(),
+        "Attic patch is not a regular file"
+    );
+    let patch = fs::read(&patch_path).context("Failed to read attic patch")?;
+    let worktree = dunce::canonicalize(worktree).context("Failed to locate restored worktree")?;
+    let mut files = Vec::new();
+    let mut destinations = BTreeSet::new();
+    for group in ["untracked", "ignored-env"] {
+        let source = entry.path.join(group);
+        ensure!(is_directory(&source)?, "Missing attic directory: {group}");
+        for relative in leaf_paths(&source)? {
+            validate_relative(&relative)?;
+            ensure!(
+                destinations.insert(relative.clone()),
+                "Duplicate attic path: {}",
+                format_path_for_display(&relative)
+            );
+            check_destination(&worktree, &relative)?;
+            files.push((source.join(&relative), relative));
+        }
+    }
+    if !patch.is_empty() {
+        let repo = Repository::at(&worktree)?;
+        let args = [
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--ignore-submodules=none",
+            "HEAD",
+            "--",
+        ];
+        let output = repo.worktree_at(&worktree).run_command_output(&args)?;
+        match output.status.code() {
+            Some(0) => {}
+            Some(1) => anyhow::bail!("Cannot apply attic patch: worktree has tracked changes"),
+            _ => return Err(CommandError::from_failed_output("git", &args, &output).into()),
+        }
+        for check in [true, false] {
+            let mut args = vec!["apply", "--index", "--binary", "--whitespace=nowarn"];
+            if check {
+                args.push("--check");
+            }
+            let output = Cmd::new("git")
+                .args(args.iter().copied())
+                .current_dir(&worktree)
+                .scrub_git_discovery_env()
+                .stdin_bytes(patch.clone())
+                .run()?;
+            if !output.status.success() {
+                return Err(CommandError::from_failed_output("git", &args, &output).into());
+            }
+        }
+    }
+    for (source, relative) in files {
+        copy_file(&source, &worktree, &relative)?;
+    }
+    Ok(())
+}
+
+/// Delete only recognized entries at least thirty days old, without following links.
+pub fn expire(now: Timestamp) -> anyhow::Result<usize> {
+    expire_in(&attic_root()?, now)
+}
+
+struct SavePlan {
+    patch: Vec<u8>,
+    untracked: Vec<PathBuf>,
+    env_files: Vec<PathBuf>,
+    parent: PathBuf,
+}
+
+/// Check the same inventory and refusals as save, without creating an entry.
+pub(super) fn check(repo: &Repository, facts: &WorktreeFacts) -> anyhow::Result<()> {
+    prepare_in(&attic_root()?, repo, facts).map(|_| ())
+}
+
+/// Git reports opaque ignored repositories with a trailing slash, even when
+/// their directory name starts with `.env`. Their contents stay ignored.
+pub(super) fn is_ignored_env(path: &Path) -> bool {
+    !path.as_os_str().as_encoded_bytes().ends_with(b"/")
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".env"))
+}
+
+fn prepare_in(
+    root: &Path,
+    repo: &Repository,
+    facts: &WorktreeFacts,
+) -> anyhow::Result<Option<SavePlan>> {
+    ensure_submodules_saved(&facts.path)?;
+    let patch = git_bytes(
+        repo,
+        &facts.path,
+        &[
+            "diff",
+            "--binary",
+            "--unified=3",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            "HEAD",
+            "--",
+        ],
+    )?;
+    let untracked = git_paths(
+        repo,
+        &facts.path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    let ignored = git_paths(
+        repo,
+        &facts.path,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let primary = repo.primary_worktree()?;
+    let mut env_files = Vec::new();
+    for relative in ignored {
+        if !is_ignored_env(&relative) {
+            continue;
+        }
+        let differs = match &primary {
+            Some(primary) => !same_file(&facts.path.join(&relative), &primary.join(&relative))?,
+            None => true,
+        };
+        if differs {
+            env_files.push(relative);
+        }
+    }
+    if patch.is_empty()
+        && untracked.is_empty()
+        && env_files.is_empty()
+        && facts.status_porcelain.is_empty()
+    {
+        return Ok(None);
+    }
+    for relative in untracked.iter().chain(&env_files) {
+        check_parents(&facts.path, relative, false)?;
+        let source = facts.path.join(relative);
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(
+            metadata.is_file() || metadata.is_symlink(),
+            "Cannot save non-file @ {}; preserve nested repository work first",
+            format_path_for_display(&source)
+        );
+        if metadata.is_file() {
+            fs::File::open(&source).context("Cannot read file for attic backup")?;
+        } else {
+            fs::read_link(&source)?;
+        }
+    }
+    let branch = branch_name(facts.branch.as_deref(), &facts.path)?;
+    let parent = branch_directory(root, repo, &branch)?;
+    for path in [
+        root,
+        parent
+            .parent()
+            .context("Missing attic repository directory")?,
+        &parent,
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "Refusing non-directory or symlink @ {}",
+                format_path_for_display(path)
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to inspect attic destination"),
+        }
+    }
+    Ok(Some(SavePlan {
+        patch,
+        untracked,
+        env_files,
+        parent,
+    }))
+}
+
+fn save_in(
+    root: &Path,
+    repo: &Repository,
+    facts: &WorktreeFacts,
+    backup: &BackupResult,
+    now: Timestamp,
+) -> anyhow::Result<Option<AtticEntry>> {
+    let Some(SavePlan {
+        patch,
+        untracked,
+        env_files,
+        parent,
+    }) = prepare_in(root, repo, facts)?
+    else {
+        return Ok(None);
+    };
+    let metadata = AtticMetadata {
+        repo: repo.repo_path()?.to_path_buf(),
+        branch: facts.branch.clone(),
+        tip_sha: facts.tip_sha.clone(),
+        worktree_path: facts.path.clone(),
+        time: now,
+        backup_ref: match backup {
+            BackupResult::Pushed { reference } => Some(reference.clone()),
+            BackupResult::OnRemote => None,
+            BackupResult::Failed { reason } => {
+                anyhow::bail!("Cannot save attic entry after failed backup: {reason}")
+            }
+        },
+    };
+    ensure_directory(root)?;
+    ensure_directory(
+        parent
+            .parent()
+            .context("Missing attic repository directory")?,
+    )?;
+    ensure_directory(&parent)?;
+    let pending = tempfile::Builder::new()
+        .prefix(".pending-")
+        .tempdir_in(&parent)
+        .context("Failed to create pending attic entry")?;
+    for (group, paths) in [("untracked", untracked), ("ignored-env", env_files)] {
+        let destination = pending.path().join(group);
+        ensure_directory(&destination)?;
+        for relative in paths {
+            validate_relative(&relative)?;
+            // Validate the source ancestry too: an intervening symlink must
+            // not turn a local file into a copy from outside this worktree.
+            check_parents(&facts.path, &relative, false)?;
+            copy_file(&facts.path.join(&relative), &destination, &relative)?;
+        }
+    }
+    let mut patch_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(pending.path().join("tracked.patch"))?;
+    patch_file.write_all(&patch)?;
+    patch_file.sync_all()?;
+    worktrunk::utils::write_atomically(
+        &pending.path().join("meta.json"),
+        &serde_json::to_string_pretty(&metadata)?,
+    )?;
+    let elapsed = now
+        .duration_since(UNIX_EPOCH)
+        .context("Attic time precedes the Unix epoch")?;
+    let timestamp =
+        chrono::DateTime::from_timestamp(elapsed.as_secs().try_into()?, elapsed.subsec_nanos())
+            .context("Attic time is out of range")?
+            .format("%Y%m%dT%H%M%S%.9fZ")
+            .to_string();
+    // Exclusive publication also protects simultaneous saves and a fixed test clock.
+    for suffix in 0u64.. {
+        let name = if suffix == 0 {
+            timestamp.clone()
+        } else {
+            format!("{timestamp}-{suffix:020}")
+        };
+        let path = parent.join(name);
+        match renamore::rename_exclusive(pending.path(), &path) {
+            Ok(()) => return Ok(Some(AtticEntry { path, metadata })),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("Failed to publish attic entry"),
+        }
+    }
+    anyhow::bail!("No available attic entry name")
+}
+
+fn load_latest_in(
+    root: &Path,
+    repo: &Repository,
+    branch: &str,
+) -> anyhow::Result<Option<AtticEntry>> {
+    let parent = branch_directory(root, repo, branch)?;
+    if !is_directory(root)?
+        || !is_directory(
+            parent
+                .parent()
+                .context("Missing attic repository directory")?,
+        )?
+        || !is_directory(&parent)?
+    {
+        return Ok(None);
+    }
+    let mut latest: Option<AtticEntry> = None;
+    for path in child_directories(&parent)? {
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        {
+            continue;
+        }
+        let Some(metadata) = read_metadata(&path)? else {
+            continue;
+        };
+        if metadata.repo != repo.repo_path()? || entry_branch(&metadata)? != branch {
+            continue;
+        }
+        ensure!(
+            fs::symlink_metadata(path.join("tracked.patch"))?.is_file(),
+            "Attic patch is not a regular file"
+        );
+        for group in ["untracked", "ignored-env"] {
+            ensure!(
+                is_directory(&path.join(group))?,
+                "Incomplete attic entry @ {}",
+                format_path_for_display(&path)
+            );
+        }
+        if latest.as_ref().is_none_or(|entry| {
+            metadata.time > entry.metadata.time
+                || (metadata.time == entry.metadata.time && path > entry.path)
+        }) {
+            latest = Some(AtticEntry { path, metadata });
+        }
+    }
+    Ok(latest)
+}
+
+fn expire_in(root: &Path, now: Timestamp) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for repo in child_directories(root)? {
+        for branch in child_directories(&repo)? {
+            for entry in child_directories(&branch)? {
+                if entry
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                {
+                    continue;
+                }
+                // Unknown or unreadable metadata never licenses a deletion.
+                let Ok(Some(metadata)) = read_metadata(&entry) else {
+                    continue;
+                };
+                if now
+                    .duration_since(metadata.time)
+                    .is_ok_and(|age| age >= RETENTION)
+                {
+                    // remove_dir_all removes symlink leaves themselves; it never
+                    // traverses their targets. All three directory levels above
+                    // were checked with symlink_metadata/file_type.
+                    fs::remove_dir_all(&entry).with_context(|| {
+                        format!(
+                            "Failed to expire attic entry @ {}",
+                            format_path_for_display(&entry)
+                        )
+                    })?;
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn entry_branch(metadata: &AtticMetadata) -> anyhow::Result<String> {
+    branch_name(metadata.branch.as_deref(), &metadata.worktree_path)
+}
+
+fn branch_name(branch: Option<&str>, worktree: &Path) -> anyhow::Result<String> {
+    match branch {
+        Some(branch) => Ok(branch.into()),
+        None => Ok(format!(
+            "detached-{}",
+            worktree
+                .file_name()
+                .context("Missing detached worktree name")?
+                .to_string_lossy()
+        )),
+    }
+}
+
+fn branch_directory(root: &Path, repo: &Repository, branch: &str) -> anyhow::Result<PathBuf> {
+    let name = repo
+        .repo_path()?
+        .file_name()
+        .context("Missing repository name")?;
+    let branch = branch.replace('/', "-");
+    validate_relative(Path::new(&branch))?;
+    ensure!(
+        Path::new(&branch).components().count() == 1,
+        "Invalid attic branch name"
+    );
+    Ok(root.join(name).join(branch))
+}
+
+fn git_bytes(repo: &Repository, worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let read_args: Vec<_> = std::iter::once("--no-optional-locks")
+        .chain(args.iter().copied())
+        .collect();
+    let output = repo.worktree_at(worktree).run_command_output(&read_args)?;
+    if !output.status.success() {
+        return Err(CommandError::from_failed_output("git", args, &output).into());
+    }
+    Ok(output.stdout)
+}
+
+fn ensure_submodules_saved(worktree: &Path) -> anyhow::Result<()> {
+    let index = submodule_git_bytes(worktree, &["ls-files", "--stage", "-z"])?;
+    let mut committed_tree = None;
+    for entry in index.split(|byte| *byte == 0) {
+        let Some(gitlink) = entry.strip_prefix(b"160000 ") else {
+            continue;
+        };
+        let tab = gitlink
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("Missing submodule path in git index")?;
+        let path_bytes = &gitlink[tab + 1..];
+        let relative = git_path(path_bytes)?;
+        let submodule = worktree.join(&relative);
+        let display = format_path_for_display(&submodule);
+        ensure!(
+            gitlink[..tab].ends_with(b" 0"),
+            "Cannot save submodule @ {display}: unresolved index conflict"
+        );
+        check_parents(worktree, &relative, false)?;
+        match fs::symlink_metadata(&submodule) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect submodule @ {display}"));
+            }
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "Cannot save submodule @ {display}: path contains a file or symlink"
+            ),
+        }
+        match fs::symlink_metadata(submodule.join(".git")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ensure!(
+                    fs::read_dir(&submodule)?.next().transpose()?.is_none(),
+                    "Cannot save submodule @ {display}: uninitialized directory contains files"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect submodule @ {display}"));
+            }
+            Ok(metadata) => ensure!(
+                metadata.is_file() || metadata.is_dir(),
+                "Cannot save submodule @ {display}: .git is not a regular file or directory"
+            ),
+        }
+        let status = submodule_git_bytes(
+            &submodule,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        ensure!(
+            status.is_empty(),
+            "Cannot save submodule @ {display}: uncommitted changes"
+        );
+        let head = submodule_git_bytes(&submodule, &["rev-parse", "--verify", "HEAD"])?;
+        let head = std::str::from_utf8(&head)?.trim();
+        // The index may pin a new local-only commit. Only the committed
+        // parent tree is covered by the parent's remote backup.
+        let tree = match &committed_tree {
+            Some(tree) => tree,
+            None => committed_tree.insert(submodule_git_bytes(
+                worktree,
+                &["ls-tree", "-r", "-z", "HEAD"],
+            )?),
+        };
+        let pinned = tree.split(|byte| *byte == 0).any(|entry| {
+            let Some(record) = entry.strip_prefix(b"160000 commit ") else {
+                return false;
+            };
+            let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                return false;
+            };
+            &record[..tab] == head.as_bytes() && &record[tab + 1..] == path_bytes
+        });
+        if !pinned {
+            let refs = submodule_git_bytes(
+                &submodule,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "--contains",
+                    head,
+                    "refs/remotes/",
+                ],
+            )?;
+            ensure!(
+                !refs.is_empty(),
+                "Cannot save submodule @ {display}: local-only commit {head}"
+            );
+        }
+        let ignored = submodule_git_bytes(
+            &submodule,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?;
+        for bytes in ignored
+            .split(|byte| *byte == 0)
+            .filter(|bytes| !bytes.is_empty())
+        {
+            let path = git_path(bytes)?;
+            ensure!(
+                !is_ignored_env(&path),
+                "Cannot save submodule @ {display}: ignored env file @ {}",
+                format_path_for_display(&path)
+            );
+        }
+        ensure_submodules_saved(&submodule)?;
+    }
+    Ok(())
+}
+
+fn submodule_git_bytes(worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    // A submodule has its own index and object store, even when the caller
+    // inherited discovery variables pointing at the parent repository.
+    let output = Cmd::new("git")
+        .args(args.iter().copied())
+        .current_dir(worktree)
+        .scrub_git_discovery_env()
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .run()
+        .with_context(|| {
+            format!(
+                "Failed to inspect submodule @ {}",
+                format_path_for_display(worktree)
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CommandError::from_failed_output("git", args, &output).into());
+    }
+    Ok(output.stdout)
+}
+
+fn git_paths(repo: &Repository, worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<PathBuf>> {
+    git_bytes(repo, worktree, args)?
+        .split(|byte| *byte == 0)
+        .filter(|bytes| !bytes.is_empty())
+        .map(git_path)
+        .collect()
+}
+
+fn git_path(bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(
+            std::str::from_utf8(bytes).context("Invalid UTF-8 path from git")?,
+        ))
+    }
+}
+
+fn same_file(source: &Path, counterpart: &Path) -> anyhow::Result<bool> {
+    let source_meta = fs::symlink_metadata(source)?;
+    let other_meta = match fs::symlink_metadata(counterpart) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("Failed to inspect primary env file"),
+    };
+    if source_meta.file_type() != other_meta.file_type() {
+        return Ok(false);
+    }
+    if source_meta.is_symlink() {
+        return Ok(fs::read_link(source)? == fs::read_link(counterpart)?);
+    }
+    ensure!(
+        source_meta.is_file(),
+        "Env path is not a regular file @ {}",
+        format_path_for_display(source)
+    );
+    Ok(fs::read(source)? == fs::read(counterpart)?)
+}
+
+fn is_directory(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to inspect directory @ {}",
+                format_path_for_display(path)
+            )
+        }),
+    }
+}
+
+fn ensure_directory(path: &Path) -> anyhow::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            ensure!(
+                is_directory(path)?,
+                "Refusing non-directory or symlink @ {}",
+                format_path_for_display(path)
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to create directory @ {}",
+                format_path_for_display(path)
+            )
+        }),
+    }
+}
+
+fn child_directories(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !is_directory(path)? {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn read_metadata(entry: &Path) -> anyhow::Result<Option<AtticMetadata>> {
+    let path = entry.join("meta.json");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => ensure!(metadata.is_file(), "Attic metadata is not a regular file"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Failed to inspect attic metadata"),
+    }
+    Ok(Some(
+        serde_json::from_slice(&fs::read(&path)?).with_context(|| {
+            format!(
+                "Failed to read attic metadata @ {}",
+                format_path_for_display(&path)
+            )
+        })?,
+    ))
+}
+
+fn leaf_paths(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut directories = vec![PathBuf::new()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(root.join(&directory))? {
+            let entry = entry?;
+            let relative = directory.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                directories.push(relative);
+            } else {
+                files.push(relative);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn validate_relative(path: &Path) -> anyhow::Result<()> {
+    ensure!(
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::Normal(name) if name != ".git")),
+        "Unsafe attic path: {}",
+        format_path_for_display(path)
+    );
+    Ok(())
+}
+
+fn check_parents(root: &Path, relative: &Path, create: bool) -> anyhow::Result<()> {
+    validate_relative(relative)?;
+    ensure!(
+        is_directory(root)?,
+        "Not a directory @ {}",
+        format_path_for_display(root)
+    );
+    let mut path = root.to_path_buf();
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        path.push(part);
+        if create {
+            ensure_directory(&path)?;
+        } else {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => ensure!(
+                    metadata.is_dir(),
+                    "Refusing non-directory or symlink @ {}",
+                    format_path_for_display(&path)
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error).context("Failed to inspect attic file parent"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_destination(root: &Path, relative: &Path) -> anyhow::Result<()> {
+    check_parents(root, relative, false)?;
+    let dest = root.join(relative);
+    match fs::symlink_metadata(&dest) {
+        Ok(_) => anyhow::bail!(
+            "Refusing to overwrite existing file @ {}",
+            format_path_for_display(&dest)
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("Failed to inspect restore destination"),
+    }
+}
+
+fn copy_file(source: &Path, root: &Path, relative: &Path) -> anyhow::Result<()> {
+    check_destination(root, relative)?;
+    check_parents(root, relative, true)?;
+    let dest = root.join(relative);
+    let metadata = fs::symlink_metadata(source).with_context(|| {
+        format!(
+            "Failed to inspect file @ {}",
+            format_path_for_display(source)
+        )
+    })?;
+    if metadata.is_symlink() {
+        let target = fs::read_link(source)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, &dest)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            if metadata.file_type().is_symlink_dir() {
+                std::os::windows::fs::symlink_dir(target, &dest)?;
+            } else {
+                std::os::windows::fs::symlink_file(target, &dest)?;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = target;
+            anyhow::bail!("Symlink copying is unsupported on this platform");
+        }
+    } else {
+        ensure!(
+            metadata.is_file(),
+            "Cannot copy non-regular file @ {}",
+            format_path_for_display(source)
+        );
+        let mut source_file = fs::File::open(source).with_context(|| {
+            format!("Failed to copy file @ {}", format_path_for_display(source))
+        })?;
+        let mut temp = tempfile::NamedTempFile::new_in(
+            dest.parent().context("Missing copy destination parent")?,
+        )?;
+        io::copy(&mut source_file, &mut temp)?;
+        temp.as_file().set_permissions(metadata.permissions())?;
+        temp.as_file().sync_all()?;
+        temp.persist_noclobber(&dest)
+            .map_err(|error| error.error)
+            .context("Failed to publish copied attic file")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
+    use worktrunk::testing::{TEST_EPOCH, TestRepo};
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn now() -> Timestamp {
+        UNIX_EPOCH + Duration::from_secs(TEST_EPOCH)
+    }
+
+    fn root(repo: &TestRepo) -> PathBuf {
+        repo.home_path().join("attic")
+    }
+
+    fn facts(repo: &TestRepo, path: &Path, branch: &str) -> WorktreeFacts {
+        let wt = repo.repo.worktree_at(path);
+        WorktreeFacts {
+            path: path.to_path_buf(),
+            branch: Some(branch.into()),
+            primary: false,
+            bare: false,
+            pinned: false,
+            remove_requested: false,
+            lock_reason: None,
+            busy: super::super::BusyState {
+                processes: vec![],
+                terminals: vec![],
+                unknown: false,
+            },
+            last_touch: now(),
+            dirty: true,
+            tip_sha: wt
+                .run_command(&["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .into(),
+            status_porcelain: wt
+                .run_command_output(&["status", "--porcelain"])
+                .unwrap()
+                .stdout,
+        }
+    }
+
+    fn saved(repo: &TestRepo, path: &Path, branch: &str, time: Timestamp) -> AtticEntry {
+        save_in(
+            &root(repo),
+            &repo.repo,
+            &facts(repo, path, branch),
+            &BackupResult::OnRemote,
+            time,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn tests_that_nothing_to_save_creates_no_attic() {
+        let repo = TestRepo::with_initial_commit();
+        assert!(
+            save_in(
+                &root(&repo),
+                &repo.repo,
+                &facts(&repo, repo.path(), "main"),
+                &BackupResult::OnRemote,
+                now()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_tracked_changes_and_binary_files_round_trip() {
+        let mut repo = TestRepo::with_initial_commit();
+        fs::write(repo.path().join("deleted"), "remove me").unwrap();
+        fs::write(repo.path().join("renamed"), "rename me").unwrap();
+        fs::write(repo.path().join("binary"), [0, 1, 2, 0, 255]).unwrap();
+        repo.run_git(&["add", "."]);
+        repo.run_git(&["commit", "-m", "base files"]);
+        let worktree = repo.add_worktree("feature/auth");
+        fs::write(worktree.join("file.txt"), "staged\n").unwrap();
+        repo.run_git_in(&worktree, &["add", "file.txt"]);
+        fs::write(worktree.join("file.txt"), "staged\nunstaged\n").unwrap();
+        fs::write(worktree.join("added"), "staged new file").unwrap();
+        repo.run_git_in(&worktree, &["add", "added"]);
+        fs::remove_file(worktree.join("deleted")).unwrap();
+        repo.run_git_in(&worktree, &["mv", "renamed", "new-name"]);
+        fs::write(worktree.join("binary"), [0, 3, 255, 0, 128, 7]).unwrap();
+        let entry = saved(&repo, &worktree, "feature/auth", now());
+        assert_eq!(
+            entry.path.parent().unwrap().file_name().unwrap(),
+            "feature-auth"
+        );
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        assert_eq!(
+            fs::read(dest.join("file.txt")).unwrap(),
+            b"staged\nunstaged\n"
+        );
+        assert_eq!(fs::read(dest.join("added")).unwrap(), b"staged new file");
+        assert_eq!(
+            fs::read(dest.join("binary")).unwrap(),
+            [0, 3, 255, 0, 128, 7]
+        );
+        assert!(!dest.join("deleted").exists());
+        assert!(!dest.join("renamed").exists());
+        assert_eq!(fs::read(dest.join("new-name")).unwrap(), b"rename me");
+        assert!(entry.path.join("meta.json").is_file());
+    }
+
+    #[test]
+    fn tests_that_git_display_settings_cannot_corrupt_the_patch() {
+        let mut repo = TestRepo::with_initial_commit();
+        fs::write(
+            repo.path().join("file.txt"),
+            "one\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        repo.run_git(&["commit", "-am", "multiline base"]);
+        let path = repo.add_worktree("feature/auth");
+        repo.run_git(&["config", "color.ui", "always"]);
+        repo.run_git(&["config", "diff.noprefix", "true"]);
+        repo.run_git(&["config", "diff.context", "0"]);
+        let changed = b"one\ntwo\nsaved change\nfour\nfive\n";
+        fs::write(path.join("file.txt"), changed).unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), changed);
+    }
+
+    fn submodule_worktree() -> (TestRepo, TestRepo, PathBuf) {
+        let mut repo = TestRepo::with_initial_commit();
+        let source = TestRepo::with_initial_commit();
+        fs::write(source.path().join(".gitignore"), ".env*\n").unwrap();
+        source.run_git(&["add", ".gitignore"]);
+        source.run_git(&["commit", "-m", "ignore env"]);
+        let remote = TestRepo::bare();
+        source.run_git(&[
+            "push",
+            remote.path().to_str().unwrap(),
+            "HEAD:refs/heads/main",
+        ]);
+        repo.run_git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            remote.path().to_str().unwrap(),
+            "sub",
+        ]);
+        repo.run_git(&["commit", "-am", "add submodule"]);
+        let path = repo.add_worktree("feature/auth");
+        (repo, remote, path)
+    }
+
+    fn init_submodule(repo: &TestRepo, path: &Path) {
+        repo.run_git_in(
+            path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+            ],
+        );
+    }
+
+    #[test]
+    fn tests_that_empty_uninitialized_submodules_allow_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        assert!(path.join("sub").is_dir());
+        assert_eq!(fs::read_dir(path.join("sub")).unwrap().count(), 0);
+        fs::write(path.join("notes.txt"), "parent work").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert_eq!(
+            fs::read(entry.path.join("untracked/notes.txt")).unwrap(),
+            b"parent work"
+        );
+    }
+
+    #[test]
+    fn tests_that_missing_uninitialized_submodules_allow_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        fs::remove_dir(path.join("sub")).unwrap();
+        fs::write(path.join("notes.txt"), "parent work").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert_eq!(
+            fs::read(entry.path.join("untracked/notes.txt")).unwrap(),
+            b"parent work"
+        );
+    }
+
+    #[test]
+    fn tests_that_clean_pinned_submodules_allow_saving_without_remote_refs() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        repo.run_git_in(&path.join("sub"), &["remote", "remove", "origin"]);
+        fs::write(path.join("notes.txt"), "parent work").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert_eq!(
+            fs::read(entry.path.join("untracked/notes.txt")).unwrap(),
+            b"parent work"
+        );
+    }
+
+    fn published_submodule_worktree() -> (TestRepo, TestRepo, PathBuf, String) {
+        let (repo, remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        let sub = path.join("sub");
+        repo.run_git_in(&sub, &["commit", "--allow-empty", "-m", "remote ancestor"]);
+        repo.run_git_in(&sub, &["commit", "--allow-empty", "-m", "remote tip"]);
+        repo.run_git_in(&sub, &["push", "origin", "HEAD:refs/heads/published"]);
+        repo.run_git_in(&sub, &["checkout", "HEAD~"]);
+        let sha = repo.repo.worktree_at(&sub).head_sha().unwrap().unwrap();
+        (repo, remote, path, sha)
+    }
+
+    #[test]
+    fn tests_that_submodule_commits_reachable_from_remote_refs_round_trip() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+        assert!(entry.path.join("meta.json").is_file());
+    }
+
+    #[test]
+    fn tests_that_ignored_submodule_diffs_still_round_trip() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        repo.run_git(&["config", "diff.ignoreSubmodules", "all"]);
+        assert!(
+            facts(&repo, &path, "feature/auth")
+                .status_porcelain
+                .is_empty()
+        );
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn tests_that_log_submodule_diffs_still_round_trip() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        repo.run_git(&["config", "diff.submodule", "log"]);
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn tests_that_restore_records_gitlinks_without_retargeting_initialized_submodules() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        init_submodule(&repo, &dest);
+        let old_sha = repo
+            .repo
+            .worktree_at(dest.join("sub"))
+            .head_sha()
+            .unwrap()
+            .unwrap();
+        apply(&entry, &dest).unwrap();
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            old_sha
+        );
+        assert_eq!(
+            repo.repo
+                .worktree_at(&dest)
+                .run_command(&["rev-parse", ":sub"])
+                .unwrap()
+                .trim(),
+            sha
+        );
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn tests_that_ignored_submodule_diffs_cannot_hide_restore_conflicts() {
+        let (mut repo, _remote, path, _sha) = published_submodule_worktree();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        init_submodule(&repo, &dest);
+        fs::write(dest.join("sub/file.txt"), "existing change").unwrap();
+        repo.run_git(&["config", "diff.ignoreSubmodules", "all"]);
+        assert!(apply(&entry, &dest).is_err());
+        assert_eq!(
+            fs::read(dest.join("sub/file.txt")).unwrap(),
+            b"existing change"
+        );
+        assert!(entry.path.join("meta.json").is_file());
+    }
+
+    #[test]
+    fn tests_that_submodule_local_only_commits_prevent_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        repo.run_git_in(
+            &path.join("sub"),
+            &["commit", "--allow-empty", "-m", "local only"],
+        );
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("local-only commit"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_staging_a_local_only_submodule_commit_does_not_preserve_it() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        repo.run_git_in(
+            &path.join("sub"),
+            &["commit", "--allow-empty", "-m", "local only"],
+        );
+        repo.run_git_in(&path, &["add", "sub"]);
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("local-only commit"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_nested_submodule_env_files_prevent_saving() {
+        let (repo, remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        let sub = path.join("sub");
+        repo.run_git_in(
+            &sub,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                remote.path().to_str().unwrap(),
+                "nested",
+            ],
+        );
+        repo.run_git_in(&sub, &["commit", "-am", "add nested submodule"]);
+        repo.run_git_in(&path, &["commit", "-am", "pin nested submodule"]);
+        fs::write(sub.join("nested/.env.local"), "nested secret").unwrap();
+        assert!(
+            facts(&repo, &path, "feature/auth")
+                .status_porcelain
+                .is_empty()
+        );
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub/nested") && error.contains("ignored env file"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_submodule_status_settings_cannot_hide_untracked_files() {
+        let (repo, _remote, path) = submodule_worktree();
+        init_submodule(&repo, &path);
+        let sub = path.join("sub");
+        repo.run_git_in(&sub, &["config", "status.showUntrackedFiles", "no"]);
+        fs::write(sub.join("notes.txt"), "unsaved work").unwrap();
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("uncommitted changes"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_uninitialized_submodule_contents_prevent_saving() {
+        let (repo, _remote, path) = submodule_worktree();
+        fs::write(path.join("sub/notes.txt"), "unsaved work").unwrap();
+        let error = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sub") && error.contains("uninitialized directory contains files"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+        assert_eq!(
+            fs::read(path.join("sub/notes.txt")).unwrap(),
+            b"unsaved work"
+        );
+    }
+
+    #[test]
+    fn tests_that_submodule_changes_prevent_an_incomplete_backup() {
+        let repo = TestRepo::with_initial_commit();
+        let submodule = TestRepo::with_initial_commit();
+        repo.run_git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            submodule.path().to_str().unwrap(),
+            "sub",
+        ]);
+        repo.run_git(&["commit", "-am", "add submodule"]);
+        fs::write(
+            repo.path().join("sub/file.txt"),
+            "uncommitted submodule data",
+        )
+        .unwrap();
+        let result = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, repo.path(), "main"),
+            &BackupResult::OnRemote,
+            now(),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("sub") && error.contains("uncommitted changes"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+    }
+
+    #[test]
+    fn tests_that_clean_submodules_cannot_hide_ignored_env_files_from_backup() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        let submodule = TestRepo::with_initial_commit();
+        fs::write(submodule.path().join(".gitignore"), ".env*\n").unwrap();
+        submodule.run_git(&["add", ".gitignore"]);
+        submodule.run_git(&["commit", "-m", "ignore env"]);
+        repo.run_git_in(
+            &path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                submodule.path().to_str().unwrap(),
+                "sub",
+            ],
+        );
+        repo.run_git_in(&path, &["commit", "-am", "add submodule"]);
+        fs::write(path.join("sub/.env.local"), "local secret").unwrap();
+        assert!(!repo.path().join("sub/.env.local").exists());
+        let facts = facts(&repo, &path, "feature/auth");
+        assert!(facts.status_porcelain.is_empty());
+        let result = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts,
+            &BackupResult::OnRemote,
+            now(),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("sub") && error.contains("ignored env file"),
+            "{error}"
+        );
+        assert!(!root(&repo).exists());
+        assert_eq!(
+            fs::read(path.join("sub/.env.local")).unwrap(),
+            b"local secret"
+        );
+    }
+
+    #[test]
+    fn tests_that_ignored_fixture_repositories_are_not_saved() {
+        let mut repo = TestRepo::with_initial_commit();
+        fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+        repo.run_git(&["add", ".gitignore"]);
+        repo.run_git(&["commit", "-m", "ignore nested repo"]);
+        let path = repo.add_worktree("feature/auth");
+        let nested = path.join("target/debug/wt-test-fixtures/x/repo");
+        repo.run_git(&["init", "-b", "main", nested.to_str().unwrap()]);
+        repo.run_git_in(&nested, &["commit", "--allow-empty", "-m", "nested base"]);
+        fs::write(nested.join(".env.local"), "local secret").unwrap();
+        assert!(!repo.path().join("ignored/.env.local").exists());
+        let facts = facts(&repo, &path, "feature/auth");
+        assert!(facts.status_porcelain.is_empty());
+        assert_eq!(
+            git_paths(
+                &repo.repo,
+                &path,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z"
+                ]
+            )
+            .unwrap(),
+            vec![PathBuf::from("target/debug/wt-test-fixtures/x/repo/")]
+        );
+        let result = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts,
+            &BackupResult::OnRemote,
+            now(),
+        );
+        assert!(result.unwrap().is_none());
+        assert!(!root(&repo).exists());
+        assert_eq!(
+            fs::read(nested.join(".env.local")).unwrap(),
+            b"local secret"
+        );
+    }
+
+    #[test]
+    fn tests_that_nested_untracked_files_round_trip() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::create_dir_all(path.join("nested/deep")).unwrap();
+        fs::write(path.join("nested/deep/notes with spaces"), "notes").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        assert_eq!(
+            fs::read(dest.join("nested/deep/notes with spaces")).unwrap(),
+            b"notes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_symlinks_and_unusual_paths_round_trip_without_following() {
+        use std::os::unix::fs::symlink;
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        symlink("missing-target", path.join("link")).unwrap();
+        let name = "odd-☃\nname";
+        fs::write(path.join(name), "bytes").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        assert_eq!(
+            fs::read_link(dest.join("link")).unwrap(),
+            Path::new("missing-target")
+        );
+        assert_eq!(fs::read(dest.join(name)).unwrap(), b"bytes");
+    }
+
+    #[test]
+    fn tests_that_only_differing_or_missing_ignored_env_files_are_saved() {
+        let mut repo = TestRepo::with_initial_commit();
+        fs::write(repo.path().join(".gitignore"), ".env*\nignored.log\n").unwrap();
+        repo.run_git(&["add", ".gitignore"]);
+        repo.run_git(&["commit", "-m", "ignore env"]);
+        fs::write(repo.path().join(".env.local"), "primary").unwrap();
+        fs::write(repo.path().join(".env.same"), "same").unwrap();
+        let path = repo.add_worktree("feature/auth");
+        fs::write(path.join(".env.local"), "local secret").unwrap();
+        fs::write(path.join(".env.same"), "same").unwrap();
+        fs::create_dir(path.join("nested")).unwrap();
+        fs::write(path.join("nested/.env.missing"), "new secret").unwrap();
+        fs::write(path.join("ignored.log"), "not an env file").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        assert!(!entry.path.join("ignored-env/.env.same").exists());
+        assert!(!entry.path.join("ignored-env/ignored.log").exists());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        assert_eq!(fs::read(dest.join(".env.local")).unwrap(), b"local secret");
+        assert_eq!(
+            fs::read(dest.join("nested/.env.missing")).unwrap(),
+            b"new secret"
+        );
+        fs::write(path.join(".env.local"), "primary").unwrap();
+        fs::remove_file(path.join("nested/.env.missing")).unwrap();
+        assert!(
+            save_in(
+                &root(&repo),
+                &repo.repo,
+                &facts(&repo, &path, "feature/auth"),
+                &BackupResult::OnRemote,
+                now() + DAY
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_a_copy_failure_never_publishes_an_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        let file = path.join("unreadable");
+        fs::write(&file, "keep me").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = fs::read(&file).is_err();
+        let result = save_in(
+            &root(&repo),
+            &repo.repo,
+            &facts(&repo, &path, "feature/auth"),
+            &BackupResult::OnRemote,
+            now(),
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        if !unreadable {
+            return;
+        } // Root bypasses permissions, as in the repo's other permission tests.
+        assert!(result.is_err());
+        assert!(
+            load_latest_in(&root(&repo), &repo.repo, "feature/auth")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn tests_that_apply_refuses_existing_files_before_changing_tracked_files() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::write(path.join("notes"), "saved notes").unwrap();
+        fs::write(path.join("file.txt"), "saved tracked").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        fs::write(dest.join("notes"), "existing notes").unwrap();
+        assert!(apply(&entry, &dest).is_err());
+        assert_eq!(fs::read(dest.join("notes")).unwrap(), b"existing notes");
+        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), b"hello");
+        assert!(entry.path.join("meta.json").is_file());
+    }
+
+    #[test]
+    fn tests_that_apply_preserves_dirty_tracked_files() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::write(path.join("file.txt"), "saved tracked").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        fs::write(dest.join("file.txt"), "existing tracked").unwrap();
+        assert!(apply(&entry, &dest).is_err());
+        assert_eq!(
+            fs::read(dest.join("file.txt")).unwrap(),
+            b"existing tracked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_apply_refuses_symlink_parents_and_dangling_destinations() {
+        use std::os::unix::fs::symlink;
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::create_dir(path.join("nested")).unwrap();
+        fs::write(path.join("nested/notes"), "saved").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        symlink(repo.path(), dest.join("nested")).unwrap();
+        assert!(apply(&entry, &dest).is_err());
+        assert!(!repo.path().join("notes").exists());
+        fs::remove_file(dest.join("nested")).unwrap();
+        fs::create_dir(dest.join("nested")).unwrap();
+        symlink("missing", dest.join("nested/notes")).unwrap();
+        assert!(apply(&entry, &dest).is_err());
+        assert_eq!(
+            fs::read_link(dest.join("nested/notes")).unwrap(),
+            Path::new("missing")
+        );
+    }
+
+    #[test]
+    fn tests_that_latest_ignores_incomplete_entries_and_disambiguates_branches() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::write(path.join("notes"), "old").unwrap();
+        let old = saved(&repo, &path, "feature/auth", now() - DAY);
+        fs::write(path.join("notes"), "new").unwrap();
+        let new = saved(&repo, &path, "feature/auth", now());
+        let collision_path = repo.home_path().join("other-worktree");
+        let collision = repo.add_worktree_at_path("feature-auth", &collision_path);
+        fs::write(collision.join("notes"), "other branch").unwrap();
+        saved(&repo, &collision, "feature-auth", now() + DAY);
+        let pending = new.path.parent().unwrap().join(".pending-crash");
+        fs::create_dir(&pending).unwrap();
+        fs::copy(old.path.join("meta.json"), pending.join("meta.json")).unwrap();
+        assert_eq!(
+            load_latest_in(&root(&repo), &repo.repo, "feature/auth")
+                .unwrap()
+                .unwrap()
+                .path,
+            new.path
+        );
+    }
+
+    #[test]
+    fn tests_that_expiry_uses_the_30_day_boundary_and_keeps_unrelated_folders() {
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::write(path.join("notes"), "saved").unwrap();
+        let young = saved(&repo, &path, "feature/auth", now() - DAY * 29);
+        let old = saved(&repo, &path, "feature/auth", now() - DAY * 30);
+        let unknown = old.path.parent().unwrap().join("unrelated");
+        fs::create_dir(&unknown).unwrap();
+        fs::write(unknown.join("precious"), "keep").unwrap();
+        let invalid = old.path.parent().unwrap().join("invalid");
+        fs::create_dir(&invalid).unwrap();
+        fs::write(invalid.join("meta.json"), "invalid json").unwrap();
+        assert_eq!(expire_in(&root(&repo), now()).unwrap(), 1);
+        assert!(!old.path.exists());
+        assert!(young.path.exists());
+        assert!(unknown.join("precious").exists());
+        assert!(invalid.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_expiry_never_follows_symlinks_outside_the_attic() {
+        use std::os::unix::fs::symlink;
+        let mut repo = TestRepo::with_initial_commit();
+        let path = repo.add_worktree("feature/auth");
+        fs::write(path.join("notes"), "saved").unwrap();
+        let entry = saved(&repo, &path, "feature/auth", now() - DAY * 30);
+        let outside = repo.home_path().join("outside");
+        fs::rename(&entry.path, &outside).unwrap();
+        symlink(&outside, &entry.path).unwrap();
+        assert_eq!(expire_in(&root(&repo), now()).unwrap(), 0);
+        assert!(outside.join("meta.json").exists());
+        assert_eq!(expire_in(&entry.path, now()).unwrap(), 0);
+        assert!(outside.join("meta.json").exists());
+    }
+}

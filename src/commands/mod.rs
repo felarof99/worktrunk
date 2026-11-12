@@ -1,5 +1,6 @@
 mod alias;
 pub(crate) mod backup;
+pub mod clean;
 pub(crate) mod command_approval;
 pub(crate) mod command_executor;
 pub(crate) mod commit;

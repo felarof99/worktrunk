@@ -54,6 +54,11 @@ const STDOUT_ALLOWED_PATHS: &[&str] = &[
     "commands/config/hints.rs",
     // Alias introspection output (show / dry-run), intended to be pipeable
     "commands/config/alias.rs",
+    // Dry-run verdict rows for wt clean rm and wt clean sweep, intended to be pipeable
+    "commands/clean/rm.rs",
+    "commands/clean/sweep.rs",
+    // The restored worktree path: the pipeable answer of wt clean restore
+    "commands/clean/restore.rs",
     // Template evaluation output for scripting
     "commands/eval.rs",
     // LLM prompt output for wt step commit --show-prompt and squash --show-prompt
