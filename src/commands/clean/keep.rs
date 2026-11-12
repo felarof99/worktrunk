@@ -1,10 +1,12 @@
 //! Pins and remove-requested marks shared by rm and sweep.
 //!
-//! Each worktree owns `<git-dir>/wt/clean.json`: `.git/wt/clean.json` for
-//! the main worktree, `.git/worktrees/<id>/wt/clean.json` for a linked one.
-//! The admin directory is the identity and lifetime boundary, not the branch
-//! or checkout path. Git removes it when unregistering a linked worktree, so
-//! a new checkout at the same path cannot inherit either mark.
+//! Each worktree owns an immutable `<git-dir>/wt/clean-id.json` pointing to
+//! its marks in the shared `.git/wt/clean/<unique-id>/marks.json`. The ID is
+//! allocated in that shared directory and published without overwriting an
+//! existing ID. Git deletes the pointer when unregistering a linked worktree;
+//! a new checkout at the same path gets a different ID. Old mark directories
+//! remain: a writer already waiting on their lock must never reach a replacement
+//! worktree, even if Git reuses the admin directory's name.
 //!
 //! Reads never create state and fail closed on malformed or unreadable data.
 //! Writers lock a sibling file, reload, change one flag, and atomically replace
@@ -62,7 +64,11 @@ pub fn run(branch: Option<&str>, off: bool) -> anyhow::Result<()> {
 /// Absent marks mean false; unreadable state is an error rather than permission
 /// to remove a possibly pinned worktree.
 pub fn load_state(repo: &Repository, worktree: &Path) -> anyhow::Result<KeepState> {
-    let marks: Marks = load_json(&state_path(repo, worktree)?)?.unwrap_or_default();
+    let identity = identity_path(repo, worktree)?;
+    let marks: Marks = match marks_path(repo, &identity)? {
+        Some(path) => load_json(&path)?.context("Worktree cleanup marks are missing")?,
+        None => Marks::default(),
+    };
     Ok(KeepState {
         pinned: marks.pinned,
         remove_requested: marks.remove_requested,
@@ -95,7 +101,7 @@ pub fn set_remove_requested(
     update(repo, worktree, |marks| marks.remove_requested = requested)
 }
 
-fn state_path(repo: &Repository, worktree: &Path) -> anyhow::Result<PathBuf> {
+fn identity_path(repo: &Repository, worktree: &Path) -> anyhow::Result<PathBuf> {
     let worktree = repo.worktree_at(worktree);
     worktree.ensure_holds_this_worktree()?;
     // This lookup names the selected worktree, so neither cached discovery nor
@@ -112,7 +118,69 @@ fn state_path(repo: &Repository, worktree: &Path) -> anyhow::Result<PathBuf> {
     }
     let dir = dunce::canonicalize(String::from_utf8(output.stdout)?.trim())
         .context("Failed to resolve worktree admin directory")?;
-    Ok(dir.join("wt/clean.json"))
+    Ok(dir.join("wt/clean-id.json"))
+}
+
+fn marks_path(repo: &Repository, identity: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let Some(id) = load_json::<String>(identity)? else {
+        return Ok(None);
+    };
+    // Only IDs this module allocates may select a state directory; an edited
+    // pointer must not redirect a mark update to an arbitrary path.
+    anyhow::ensure!(
+        id.strip_prefix("worktree-").is_some_and(
+            |suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+        ),
+        "Invalid worktree cleanup identity"
+    );
+    Ok(Some(
+        repo.wt_dir().join("clean").join(id).join("marks.json"),
+    ))
+}
+
+fn create_state(repo: &Repository, identity: &Path) -> anyhow::Result<PathBuf> {
+    let parent = identity
+        .parent()
+        .context("Cleanup identity has no parent directory")?;
+    create_state_dir(parent)?;
+    // The temporary pointer belongs to this admin directory before publishing.
+    // If removal deletes it, publication fails instead of recreating it.
+    let pointer = tempfile::NamedTempFile::new_in(parent)?;
+    create_state_dir(&repo.wt_dir())?;
+    let store = repo.wt_dir().join("clean");
+    create_state_dir(&store)?;
+    let generation = tempfile::Builder::new()
+        .prefix("worktree-")
+        .tempdir_in(&store)?;
+    let id = generation
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Invalid cleanup state directory name")?;
+    let path = generation.path().join("marks.json");
+    write_atomically(&path, &serde_json::to_string(&Marks::default())?)?;
+    write_atomically(pointer.path(), &serde_json::to_string(id)?)?;
+    match pointer.persist_noclobber(identity) {
+        Ok(_) => {
+            let _ = generation.keep();
+            Ok(path)
+        }
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+            // Another first writer won. This unpublished directory is dropped;
+            // both writers subsequently lock the winning generation's file.
+            marks_path(repo, identity)?.context("Worktree cleanup identity disappeared")
+        }
+        Err(error) => Err(error.error).context("Failed to create worktree cleanup identity"),
+    }
+}
+
+fn create_state_dir(path: &Path) -> anyhow::Result<()> {
+    // Single-level creation never resurrects a deleted Git admin directory.
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).context("Failed to create worktree cleanup state directory"),
+    }
 }
 
 fn update(
@@ -120,21 +188,20 @@ fn update(
     worktree: &Path,
     mutate: impl FnOnce(&mut Marks),
 ) -> anyhow::Result<()> {
-    let path = state_path(repo, worktree)?;
-    let parent = path
-        .parent()
-        .context("Cleanup state has no parent directory")?;
-    // Never recreate an admin directory that a concurrent removal deleted.
-    match fs::create_dir(parent) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(error).context("Failed to create worktree cleanup state directory");
-        }
-    }
+    let identity = identity_path(repo, worktree)?;
+    let path = match marks_path(repo, &identity)? {
+        Some(path) => path,
+        None => create_state(repo, &identity)?,
+    };
     let _lock = lock_state(&path)?;
-    let mut marks: Marks = load_json(&path)?.unwrap_or_default();
+    let mut marks: Marks = load_json(&path)?.context("Worktree cleanup marks are missing")?;
     mutate(&mut marks);
+    anyhow::ensure!(
+        marks_path(repo, &identity)?.as_ref() == Some(&path),
+        "Worktree changed during cleanup state update"
+    );
+    // A replacement after this check still cannot redirect the write: `path`
+    // names this generation, never the reusable checkout/admin pathname.
     write_atomically(&path, &serde_json::to_string(&marks)?).with_context(|| {
         format!(
             "Failed to save cleanup marks @ {}",
@@ -201,12 +268,10 @@ mod tests {
 
     use super::*;
 
-    fn marks_path(repo: &Repository, path: &Path) -> PathBuf {
-        let dir = repo
-            .worktree_at(path)
-            .run_command(&["rev-parse", "--absolute-git-dir"])
-            .unwrap();
-        Path::new(dir.trim()).join("wt/clean.json")
+    fn state_file(repo: &Repository, path: &Path) -> PathBuf {
+        marks_path(repo, &identity_path(repo, path).unwrap())
+            .unwrap()
+            .unwrap()
     }
 
     fn assert_marks(repo: &Repository, path: &Path, pinned: bool, requested: bool) {
@@ -220,7 +285,7 @@ mod tests {
         let path = fixture.add_worktree("feature");
         let repo = Repository::at(fixture.root_path()).unwrap();
         assert_marks(&repo, &path, false, false);
-        assert!(!marks_path(&repo, &path).exists());
+        assert!(!identity_path(&repo, &path).unwrap().exists());
         set_pin(&repo, &path, true).unwrap();
         assert_marks(&repo, &path, true, false);
         set_remove_requested(&repo, &path, true).unwrap();
@@ -256,14 +321,53 @@ mod tests {
         let repo = Repository::at(fixture.root_path()).unwrap();
         set_pin(&repo, &path, true).unwrap();
         set_remove_requested(&repo, &path, true).unwrap();
-        let old_marks = marks_path(&repo, &path);
+        let old_marks = state_file(&repo, &path);
+        let identity = identity_path(&repo, &path).unwrap();
         fixture.run_git(&["worktree", "remove", path.to_str().unwrap()]);
-        assert!(!old_marks.exists());
+        assert!(!identity.exists());
         // Clearing a completed removal must not recreate its admin directory.
         set_remove_requested(&repo, &path, false).unwrap();
-        assert!(!old_marks.exists());
+        assert!(!identity.exists());
         fixture.run_git(&["worktree", "add", path.to_str().unwrap(), "feature"]);
         assert_marks(&repo, &path, false, false);
+        assert!(
+            old_marks.exists(),
+            "old generations remain isolated from new worktrees"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_pending_mark_updates_cannot_reach_replacements() {
+        for request_removal in [false, true] {
+            let mut fixture = TestRepo::with_initial_commit();
+            let path = fixture.add_worktree("old");
+            let repo = Repository::at(fixture.root_path()).unwrap();
+            set_pin(&repo, &path, true).unwrap();
+            // The mutation callback runs while the old writer owns its lock.
+            // Recreate at this causal boundary, without scheduling or sleeps.
+            let result = update(&repo, &path, |marks| {
+                fixture.run_git(&["worktree", "remove", path.to_str().unwrap()]);
+                fixture.run_git(&[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "replacement",
+                    path.to_str().unwrap(),
+                ]);
+                set_pin(&repo, &path, true).unwrap();
+                if request_removal {
+                    marks.remove_requested = true;
+                } else {
+                    marks.pinned = false;
+                }
+            });
+            assert_marks(&repo, &path, true, false);
+            assert!(
+                result.is_err(),
+                "obsolete update should report the replaced worktree"
+            );
+        }
     }
 
     #[test]
@@ -272,7 +376,7 @@ mod tests {
         let path = fixture.add_worktree("feature");
         let repo = Repository::at(fixture.root_path()).unwrap();
         set_pin(&repo, &path, true).unwrap();
-        let state_path = marks_path(&repo, &path);
+        let state_path = state_file(&repo, &path);
         for content in [
             "not json",
             "{}",
@@ -288,6 +392,25 @@ mod tests {
         fs::create_dir(&state_path).unwrap();
         assert!(load_state(&repo, &path).is_err());
         assert!(set_pin(&repo, &path, false).is_err());
+    }
+
+    #[test]
+    fn tests_that_corrupt_identities_and_missing_generations_fail_closed() {
+        let mut fixture = TestRepo::with_initial_commit();
+        let path = fixture.add_worktree("feature");
+        let repo = Repository::at(fixture.root_path()).unwrap();
+        set_pin(&repo, &path, true).unwrap();
+        let state = state_file(&repo, &path);
+        let before = fs::read(&state).unwrap();
+        let identity = identity_path(&repo, &path).unwrap();
+        for contents in ["not json", r#""../other""#, r#""worktree-missing""#] {
+            fs::write(&identity, contents).unwrap();
+            assert!(load_state(&repo, &path).is_err());
+            assert!(set_pin(&repo, &path, false).is_err());
+            assert!(set_remove_requested(&repo, &path, true).is_err());
+            assert_eq!(fs::read(&state).unwrap(), before);
+            assert_eq!(fs::read_to_string(&identity).unwrap(), contents);
+        }
     }
 
     #[test]

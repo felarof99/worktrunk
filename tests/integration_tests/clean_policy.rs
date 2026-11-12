@@ -14,7 +14,7 @@ fn tests_that_clean_keep_pins_unpins_and_registers_by_branch_path_or_current() {
     let path = fixture.add_worktree("feature/auth");
     let repo = Repository::at(fixture.root_path()).unwrap();
     let admin = repo.worktree_at(&path).git_dir().unwrap();
-    let marks = admin.join("wt/clean.json");
+    let identity = admin.join("wt/clean-id.json");
     let registry = fixture
         .test_config_path()
         .with_file_name("clean-repositories.json");
@@ -38,7 +38,9 @@ fn tests_that_clean_keep_pins_unpins_and_registers_by_branch_path_or_current() {
         assert!(output.status.success(), "{output:?}");
         assert!(output.stdout.is_empty());
         messages.push(String::from_utf8(output.stderr).unwrap());
-        let state: serde_json::Value = serde_json::from_slice(&fs::read(&marks).unwrap()).unwrap();
+        let id: String = serde_json::from_slice(&fs::read(&identity).unwrap()).unwrap();
+        let marks = repo.wt_dir().join("clean").join(id).join("marks.json");
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(marks).unwrap()).unwrap();
         assert_eq!(state["pinned"], pinned);
         assert_eq!(state["remove_requested"], false);
     }
@@ -83,11 +85,11 @@ fn tests_that_clean_keep_marks_the_selected_worktree_with_inherited_git_dir() {
     let mut fixture = TestRepo::with_initial_commit();
     let path = fixture.add_worktree("feature");
     let repo = Repository::at(fixture.root_path()).unwrap();
-    let marks = repo
+    let identity = repo
         .worktree_at(&path)
         .git_dir()
         .unwrap()
-        .join("wt/clean.json");
+        .join("wt/clean-id.json");
     let output = fixture
         .wt_command()
         .args(["clean", "keep", "feature"])
@@ -95,6 +97,6 @@ fn tests_that_clean_keep_marks_the_selected_worktree_with_inherited_git_dir() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert!(marks.is_file(), "selected worktree was not pinned");
-    assert!(!fixture.root_path().join(".git/wt/clean.json").exists());
+    assert!(identity.is_file(), "selected worktree was not pinned");
+    assert!(!fixture.root_path().join(".git/wt/clean-id.json").exists());
 }
