@@ -357,3 +357,114 @@ fn tests_that_clean_sweep_exits_unsuccessfully_when_expiry_fails() {
     );
     assert_eq!(fs::read_to_string(invalid_home).unwrap(), "preserve");
 }
+
+#[cfg(unix)]
+#[test]
+fn tests_that_clean_sweep_keeps_worktrees_when_git_path_overrides_make_facts_ambiguous() {
+    let mut fixture = TestRepo::with_initial_commit();
+    let linked = fixture.add_worktree("fresh");
+    let old = UNIX_EPOCH + Duration::from_secs(TEST_EPOCH - 2 * 86_400);
+    for file in ["HEAD", "index", "logs/HEAD"] {
+        fs::File::options()
+            .write(true)
+            .open(fixture.root_path().join(".git").join(file))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let output = command(&fixture)
+        .args(["--dry-run", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["reason"], "recent");
+    for (variable, path) in [
+        ("GIT_DIR", fixture.root_path().join(".git")),
+        ("GIT_WORK_TREE", fixture.root_path().into()),
+    ] {
+        let output = command(&fixture)
+            .env(variable, path)
+            .args(["--dry-run", "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], serde_json::json!(linked));
+        assert_eq!(rows[0]["verdict"], "kept");
+        let reason = rows[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("Git path overrides prevent worktree inspection")
+                && reason.contains(variable),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn tests_that_clean_sweep_resolves_relative_roots_under_global_c() {
+    let mut caller = TestRepo::with_initial_commit();
+    let mut selected = TestRepo::with_initial_commit();
+    for (fixture, branch) in [(&mut caller, "caller"), (&mut selected, "selected")] {
+        let root = fixture.home_path().join("root");
+        fs::create_dir(&root).unwrap();
+        fixture.add_worktree_at_path(branch, &root.join(branch));
+    }
+    let output = command(&caller)
+        .current_dir(caller.home_path())
+        .arg("-C")
+        .arg(selected.home_path())
+        .args([
+            "--all-repos",
+            "--root",
+            "root",
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let rows: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["repo"], serde_json::json!(selected.root_path()));
+    assert_eq!(rows[0]["branch"], "selected");
+}
+
+#[cfg(unix)]
+#[rstest::rstest]
+#[case("hc", "INT", 130)]
+#[case("hc", "TERM", 143)]
+#[case("lsof", "INT", 130)]
+#[case("lsof", "TERM", 143)]
+fn tests_that_clean_sweep_stops_without_writes_after_an_activity_interrupt(
+    #[case] probe: &str,
+    #[case] signal: &str,
+    #[case] status: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = TestRepo::with_initial_commit();
+    let old = attic_entry(&fixture, 31);
+    let mut cmd = command(&fixture);
+    let path = fixture.home_path().join("sweep-bin").join(probe);
+    // Replace only the fixture's link, never write through it to the wt binary.
+    fs::remove_file(&path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh
+kill -{signal} $$
+"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = cmd.args(["--format", "json"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(status), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(old.join("saved").exists());
+    for file in ["clean-repositories.json", "clean-terminal-history.json"] {
+        assert!(!fixture.test_config_path().with_file_name(file).exists());
+    }
+}

@@ -14,8 +14,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Context;
 use color_print::cformat;
-use worktrunk::git::{ErrorExt, Repository, WorktrunkError};
+use worktrunk::git::{ErrorExt, Repository, WorktrunkError, resolve_input_path};
 use worktrunk::path::format_path_for_display;
+use worktrunk::shell_exec::INHERITED_GIT_PATH_VARS;
 use worktrunk::styling::{
     eprintln, format_heading, info_message, println, progress_message, success_message,
     warning_message,
@@ -70,7 +71,8 @@ fn run_with_remover(
         }
         Err(error) => return Err(error),
     };
-    let selection = registry::load_repositories(current.as_ref(), all_repos, roots)?;
+    let roots: Vec<_> = roots.iter().map(resolve_input_path).collect();
+    let selection = registry::load_repositories(current.as_ref(), all_repos, &roots)?;
     for skipped in selection.skipped {
         report_skipped(&skipped.path, &skipped.reason);
     }
@@ -140,6 +142,14 @@ fn sweep_repository(
 ) -> anyhow::Result<Vec<CleanRow>> {
     let repo_path = repo.repo_path()?;
     let bare = repo.is_bare()?;
+    // Shared WorkingTree commands honor inherited Git context. Until they can
+    // isolate each checkout, these overrides make both age and backup inputs
+    // ambiguous, even when they still identify the same repository.
+    let overrides: Vec<_> = INHERITED_GIT_PATH_VARS
+        .iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .copied()
+        .collect();
     let mut rows = Vec::new();
     let mut candidates = Vec::new();
     for worktree in repo.list_worktrees()? {
@@ -161,6 +171,11 @@ fn sweep_repository(
             row.reason = keep_reason(&KeepReason::Primary);
         } else {
             let decision = (|| {
+                anyhow::ensure!(
+                    overrides.is_empty(),
+                    "Git path overrides prevent worktree inspection: {}; unset them and retry",
+                    overrides.join(", ")
+                );
                 let busy = terminals::busy_for(&worktree.path, activity)?;
                 let facts = facts::load(repo, worktree, busy, now)?;
                 let verdict = policy::sweep(&facts, now)?;

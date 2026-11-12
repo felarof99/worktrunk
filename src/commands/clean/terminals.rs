@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use worktrunk::git::CommandError;
+use worktrunk::git::{CommandError, ErrorExt, WorktrunkError};
 use worktrunk::shell_exec::Cmd;
 use worktrunk::utils::write_atomically;
 
@@ -69,6 +69,9 @@ pub fn load(now: Timestamp, dry_run: bool) -> anyhow::Result<ActivitySnapshot> {
     let (processes, mut unknown) = match load_processes() {
         Ok(processes) => (processes, false),
         Err(err) => {
+            if let Some(signal) = err.interrupt_signal() {
+                return Err(WorktrunkError::Interrupted { signal, hint: None }.into());
+            }
             log::debug!("clean process inspection failed: {err:#}");
             (Vec::new(), true)
         }
@@ -83,6 +86,9 @@ pub fn load(now: Timestamp, dry_run: bool) -> anyhow::Result<ActivitySnapshot> {
     let mut terminals = match load_terminals() {
         Ok(terminals) => terminals,
         Err(err) => {
+            if let Some(signal) = err.interrupt_signal() {
+                return Err(WorktrunkError::Interrupted { signal, hint: None }.into());
+            }
             log::debug!("clean terminal inspection failed: {err:#}");
             unknown = true;
             return Ok(ActivitySnapshot {
