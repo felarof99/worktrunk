@@ -3,9 +3,10 @@
 //! Status and HEAD are read afresh, with optional git locks disabled so the
 //! observation cannot refresh the index's mtime. Preserve the ordinary porcelain
 //! bytes for backup comparisons; a second NUL-delimited, fully expanded status
-//! supplies filesystem paths, including individual untracked files. Missing
-//! files are allowed only when status reports their deletion. All other failed
-//! reads abort collection, never manufacture a clean or old worktree.
+//! supplies filesystem paths, including individual untracked files. If ordinary
+//! status hides untracked files, fail rather than provide an incomplete backup
+//! comparison. Deleted files have no trustworthy timestamp, so they and other
+//! failed reads abort collection, never manufacture a clean or old worktree.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,8 +45,10 @@ pub(super) fn load_with_keep_state(
     let wt = repo.worktree_at(&worktree.path);
     let admin = wt.git_dir()?;
     let bare = repo.is_bare()?;
-    let primary =
-        !bare && dunce::canonicalize(repo.repo_path()?)? == dunce::canonicalize(&worktree.path)?;
+    let primary = match repo.primary_worktree()? {
+        Some(primary) => dunce::canonicalize(primary)? == dunce::canonicalize(&worktree.path)?,
+        None => false,
+    };
     let tip_sha = wt.run_command(&["rev-parse", "--verify", "HEAD"])?;
     let tip_sha = tip_sha.trim().to_owned();
     anyhow::ensure!(!tip_sha.is_empty(), "Worktree has no HEAD commit");
@@ -56,9 +59,9 @@ pub(super) fn load_with_keep_state(
     };
 
     let mut last_touch = modified(&admin.join("HEAD"))?;
-    let status_porcelain = if worktree.bare {
+    let (status_porcelain, dirty) = if worktree.bare {
         // A bare git directory has neither an index nor working-tree status.
-        Vec::new()
+        (Vec::new(), false)
     } else {
         for name in ["index", "logs/HEAD"] {
             last_touch = last_touch.max(modified(&admin.join(name))?);
@@ -74,22 +77,28 @@ pub(super) fn load_with_keep_state(
                 "-uall",
             ],
         )?;
-        for (path, deleted) in changed_paths(&paths)? {
-            let path = worktree.path.join(path);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) => last_touch = last_touch.max(metadata.modified()?),
-                Err(err) if deleted && err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "Failed to read changed file @ {}",
-                            format_path_for_display(&path)
-                        )
-                    });
-                }
-            }
+        let paths = changed_paths(&paths)?;
+        anyhow::ensure!(
+            !paths.iter().any(|p| p.untracked)
+                || status
+                    .split(|b| *b == b'\n')
+                    .any(|line| line.starts_with(b"?? ")),
+            "Git status omitted untracked files; cannot verify cleanup"
+        );
+        let dirty = !status.is_empty() || !paths.is_empty();
+        for changed in paths {
+            let path = worktree.path.join(changed.path);
+            let time = fs::symlink_metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .with_context(|| {
+                    format!(
+                        "Failed to read changed file timestamp @ {}",
+                        format_path_for_display(&path)
+                    )
+                })?;
+            last_touch = last_touch.max(time);
         }
-        status
+        (status, dirty)
     };
     Ok(WorktreeFacts {
         path: worktree.path.clone(),
@@ -101,7 +110,7 @@ pub(super) fn load_with_keep_state(
         lock_reason,
         busy,
         last_touch,
-        dirty: !status_porcelain.is_empty(),
+        dirty,
         tip_sha,
         status_porcelain,
     })
@@ -126,10 +135,14 @@ fn status_bytes(wt: &WorkingTree<'_>, args: &[&str]) -> anyhow::Result<Vec<u8>> 
     Ok(output.stdout)
 }
 
-/// Preserve non-UTF-8 filenames on Unix. Rename sources have no remaining
-/// file to timestamp; their destinations do. A missing destination is an error
-/// unless the worktree column explicitly reports a deletion.
-fn changed_paths(status: &[u8]) -> anyhow::Result<Vec<(PathBuf, bool)>> {
+struct ChangedPath {
+    path: PathBuf,
+    untracked: bool,
+}
+
+/// Preserve non-UTF-8 filenames on Unix. Rename sources are historical names;
+/// timestamp their destinations, failing if the destination has since vanished.
+fn changed_paths(status: &[u8]) -> anyhow::Result<Vec<ChangedPath>> {
     anyhow::ensure!(
         status.is_empty() || status.ends_with(&[0]),
         "Incomplete git status"
@@ -156,7 +169,10 @@ fn changed_paths(status: &[u8]) -> anyhow::Result<Vec<(PathBuf, bool)>> {
                     .all(|c| matches!(c, std::path::Component::Normal(_))),
             "Invalid git status path"
         );
-        paths.push((path, entry[..2].contains(&b'D')));
+        paths.push(ChangedPath {
+            path,
+            untracked: entry.starts_with(b"?? "),
+        });
         if entry[..2].iter().any(|b| matches!(b, b'R' | b'C')) {
             anyhow::ensure!(
                 entries.next().is_some_and(|source| !source.is_empty()),

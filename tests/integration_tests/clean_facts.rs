@@ -229,7 +229,7 @@ fn tests_that_clean_facts_read_a_fresh_tip_and_detached_head() {
 }
 
 #[test]
-fn tests_that_clean_facts_handle_renames_deletions_and_quoted_names() {
+fn tests_that_clean_facts_handle_renames_and_quoted_names() {
     let mut repo = TestRepo::with_initial_commit();
     let path = repo.add_worktree("feature");
     repo.run_git_in(&path, &["mv", "file.txt", "renamed file"]);
@@ -238,8 +238,54 @@ fn tests_that_clean_facts_handle_renames_deletions_and_quoted_names() {
     fs::write(path.join("quotes\" and newline\n"), "new").unwrap();
     let facts = observe(&repo, &path).unwrap();
     assert!(facts.dirty);
-    fs::remove_file(path.join("renamed file")).unwrap();
-    assert!(observe(&repo, &path).unwrap().dirty);
+}
+
+#[test]
+fn tests_that_clean_facts_refuse_status_that_hides_untracked_files() {
+    let repo = TestRepo::with_initial_commit();
+    repo.run_git(&["config", "status.showUntrackedFiles", "no"]);
+    fs::write(repo.path().join("untracked.txt"), "unsaved work").unwrap();
+    let raw = repo
+        .repo
+        .worktree_at(repo.path())
+        .run_command(&["--no-optional-locks", "status", "--porcelain"])
+        .unwrap();
+    assert!(
+        raw.is_empty(),
+        "precondition: ordinary status hides the file"
+    );
+    assert!(
+        observe(&repo, repo.path()).is_err(),
+        "hidden files must prevent cleanup"
+    );
+    fs::write(repo.path().join("file.txt"), "tracked edit").unwrap();
+    assert!(
+        observe(&repo, repo.path()).is_err(),
+        "tracked edits cannot mask hidden files"
+    );
+}
+
+#[test]
+fn tests_that_clean_facts_refuse_untimestamped_deletions() {
+    let mut repo = TestRepo::with_initial_commit();
+    let path = repo.add_worktree("feature");
+    let admin = repo.repo.worktree_at(&path).git_dir().unwrap();
+    let old = now() - Duration::from_secs(8 * 24 * 60 * 60);
+    for name in ["index", "HEAD", "logs/HEAD"] {
+        set_time(&admin.join(name), old);
+    }
+    fs::remove_file(path.join("file.txt")).unwrap();
+    assert!(
+        repo.repo
+            .worktree_at(&path)
+            .run_command(&["--no-optional-locks", "status", "--porcelain"])
+            .unwrap()
+            .starts_with(" D file.txt")
+    );
+    assert!(
+        observe(&repo, &path).is_err(),
+        "a new deletion must not look eight days old"
+    );
 }
 
 #[test]
@@ -259,10 +305,26 @@ fn tests_that_clean_facts_mark_linked_worktrees_of_bare_repos() {
     let seed = TestRepo::with_initial_commit();
     let path = repo.path().join("linked");
     repo.run_git(&["config", "core.logAllRefUpdates", "true"]);
+    repo.run_git(&["config", "worktrunk.default-branch", "feature"]);
     repo.run_git(&["fetch", seed.path().to_str().unwrap(), "main:feature"]);
     repo.run_git(&["worktree", "add", path.to_str().unwrap(), "feature"]);
     let facts = observe(&repo, &path).unwrap();
     assert!(facts.bare);
+    assert!(
+        facts.primary,
+        "the default-branch worktree is the bare repo's home"
+    );
+    let other = repo.path().join("other");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "other",
+        other.to_str().unwrap(),
+        "feature",
+    ]);
+    let facts = observe(&repo, &other).unwrap();
+    assert!(facts.bare && !facts.primary);
 }
 
 fn terminal(path: &Path, status: Option<TerminalStatus>, turn: u64) -> HcTerminal {
