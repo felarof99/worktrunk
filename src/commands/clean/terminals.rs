@@ -2,8 +2,12 @@
 //!
 //! Unix uses one batched lsof cwd listing, including parent PIDs, and the
 //! existing reap parser. Exclude this process and its descendants, never its
-//! ancestors. Missing, failed, or incomplete inspection means unknown activity.
-//! Windows conservatively reports unknown process activity.
+//! ancestors. Missing or failed listings and malformed parent records mean
+//! unknown activity. A process with no absolute cwd has no folder to match;
+//! skip it while retaining its parent relationship for descendant exclusion.
+//! Windows conservatively reports unknown process activity. Resolve worktree
+//! roots, but match unresolved cwds lexically against both root names so a gone
+//! or inaccessible folder outside the worktree does not make it unknown.
 //!
 //! hc returns an object containing live terminals; unknown status words mean
 //! working. History lives in clean-terminal-history.json beside user config,
@@ -128,15 +132,13 @@ pub fn load(now: Timestamp, dry_run: bool) -> anyhow::Result<ActivitySnapshot> {
 /// Select processes whose cwd and live terminals whose launch cwd lie inside
 /// this worktree. This is a pure path-membership operation on an observation;
 /// unknown activity must remain unknown rather than become an empty busy set.
+/// If a cwd cannot be resolved, compare it lexically against the resolved root
+/// and the supplied root. Only the worktree root itself must resolve.
 pub fn busy_for(path: &Path, activity: &ActivitySnapshot) -> anyhow::Result<BusyState> {
     let root = dunce::canonicalize(path).context("Failed to resolve worktree path")?;
-    let mut unknown = activity.unknown;
-    let mut inside = |cwd: &Path| match dunce::canonicalize(cwd) {
+    let inside = |cwd: &Path| match dunce::canonicalize(cwd) {
         Ok(cwd) => cwd.starts_with(&root),
-        Err(_) => {
-            unknown = true;
-            false
-        }
+        Err(_) => cwd.starts_with(&root) || cwd.starts_with(path),
     };
     let processes = activity
         .processes
@@ -153,7 +155,7 @@ pub fn busy_for(path: &Path, activity: &ActivitySnapshot) -> anyhow::Result<Busy
     Ok(BusyState {
         processes,
         terminals,
-        unknown,
+        unknown: activity.unknown,
     })
 }
 
@@ -263,10 +265,7 @@ fn load_processes() -> anyhow::Result<Vec<ProcessInfo>> {
         }
     }
     anyhow::ensure!(
-        !listed.is_empty()
-            && parents.len() == listed.len()
-            && processes.len() == listed.len()
-            && processes.iter().all(|p| p.cwd.is_absolute()),
+        !listed.is_empty() && parents.len() == listed.len(),
         "Incomplete process listing"
     );
     let mut excluded = HashSet::from([std::process::id()]);
@@ -283,7 +282,7 @@ fn load_processes() -> anyhow::Result<Vec<ProcessInfo>> {
     }
     Ok(processes
         .into_iter()
-        .filter(|p| !excluded.contains(&p.pid))
+        .filter(|p| p.cwd.is_absolute() && !excluded.contains(&p.pid))
         .map(|p| ProcessInfo {
             pid: p.pid,
             cwd: p.cwd,

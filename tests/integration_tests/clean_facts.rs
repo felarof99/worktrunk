@@ -389,6 +389,92 @@ fn tests_that_clean_busy_membership_resolves_symlinks() {
     assert!(!busy.unknown);
 }
 
+#[test]
+fn tests_that_clean_ignores_unresolved_process_cwds_outside_the_worktree() {
+    let dir = test_tempdir();
+    let worktree = dir.path().join("worktree");
+    fs::create_dir(&worktree).unwrap();
+    let cwd = dir.path().join("Library/Containers/example/Data");
+    assert!(cwd.is_absolute() && dunce::canonicalize(&cwd).is_err());
+    let activity = ActivitySnapshot {
+        processes: vec![ProcessInfo { pid: 10, cwd }],
+        terminals: vec![],
+        unknown: false,
+    };
+    let busy = terminals::busy_for(&worktree, &activity).unwrap();
+    assert!(busy.processes.is_empty() && busy.terminals.is_empty());
+    assert!(!busy.unknown);
+}
+
+#[test]
+fn tests_that_clean_ignores_unresolved_terminal_cwds_outside_the_worktree() {
+    let dir = test_tempdir();
+    let worktree = dir.path().join("worktree");
+    let gone = dir.path().join("old-worktree");
+    fs::create_dir(&worktree).unwrap();
+    fs::create_dir(&gone).unwrap();
+    fs::remove_dir(&gone).unwrap();
+    assert!(dunce::canonicalize(&gone).is_err());
+    let activity = ActivitySnapshot {
+        processes: vec![],
+        terminals: vec![terminal(&gone, None, 0)],
+        unknown: false,
+    };
+    let busy = terminals::busy_for(&worktree, &activity).unwrap();
+    assert!(busy.processes.is_empty() && busy.terminals.is_empty());
+    assert!(!busy.unknown);
+}
+
+#[test]
+fn tests_that_clean_keeps_unresolved_cwds_in_deleted_worktree_subfolders_busy() {
+    let dir = test_tempdir();
+    let worktree = dir.path().join("worktree");
+    let gone = worktree.join("deleted");
+    fs::create_dir_all(&gone).unwrap();
+    fs::remove_dir(&gone).unwrap();
+    assert!(dunce::canonicalize(&gone).is_err());
+    let activity = ActivitySnapshot {
+        processes: vec![ProcessInfo {
+            pid: 10,
+            cwd: gone.clone(),
+        }],
+        terminals: vec![terminal(&gone, None, 0)],
+        unknown: false,
+    };
+    let busy = terminals::busy_for(&worktree, &activity).unwrap();
+    assert_eq!(busy.processes.len(), 1);
+    assert_eq!(busy.terminals.len(), 1);
+    assert!(!busy.unknown);
+    fs::remove_dir(&worktree).unwrap();
+    assert!(terminals::busy_for(&worktree, &activity).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn tests_that_clean_matches_unresolved_cwds_against_both_worktree_root_names() {
+    let dir = test_tempdir();
+    let real = dir.path().join("real");
+    let alias = dir.path().join("alias");
+    fs::create_dir_all(real.join("deleted")).unwrap();
+    let real = dunce::canonicalize(real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    fs::remove_dir(real.join("deleted")).unwrap();
+    let activity = ActivitySnapshot {
+        processes: vec![ProcessInfo {
+            pid: 10,
+            cwd: alias.join("deleted"),
+        }],
+        terminals: vec![terminal(&real.join("deleted"), None, 0)],
+        unknown: false,
+    };
+    assert!(dunce::canonicalize(&activity.processes[0].cwd).is_err());
+    assert!(dunce::canonicalize(&activity.terminals[0].cwd).is_err());
+    let busy = terminals::busy_for(&alias, &activity).unwrap();
+    assert_eq!(busy.processes.len(), 1);
+    assert_eq!(busy.terminals.len(), 1);
+    assert!(!busy.unknown);
+}
+
 fn hc_json(path: &Path, status: serde_json::Value, turn: u64) -> String {
     serde_json::json!({"hidden_finished":3,"terminals":[{
         "address":"t1","cwd":path,"state":"live","status":status,"turn":turn,
@@ -456,6 +542,12 @@ fn tests_that_clean_end_rechecks_working_status_and_turn_before_killing() {
 #[test]
 fn tests_that_clean_excludes_its_process_tree_but_keeps_ancestors() {
     activity_case("processes");
+}
+
+#[cfg(unix)]
+#[test]
+fn tests_that_clean_skips_unnamed_process_cwds_without_losing_parent_relationships() {
+    activity_case("unnamed_cwds");
 }
 
 #[test]
@@ -597,6 +689,65 @@ fn clean_activity_child() {
             terminals::end(&[terminal(&dir, Some(TerminalStatus::Done), 2)]).unwrap();
             let calls = mock_calls(&dir, "hc");
             assert_eq!(&calls[calls.len() - 3..], ["ls --json", "kill t1", "rm t1"]);
+        }
+        #[cfg(unix)]
+        "unnamed_cwds" => {
+            let pid = std::process::id();
+            let parent = nix::unistd::getppid().as_raw();
+            let output = format!(
+                "p{pid}
+R{parent}
+cwt
+fcwd
+n{}
+p1000001
+R1
+cnode
+fcwd
+ncwd|rtd info error: No such file or directory
+p1000002
+R{pid}
+cgit
+fcwd
+ncwd|rtd info error: No such file or directory
+p1000003
+R1000002
+cchild
+fcwd
+n{}
+p{parent}
+R1
+czsh
+fcwd
+n{}
+",
+                dir.display(),
+                dir.display(),
+                dir.display()
+            );
+            MockConfig::new("lsof")
+                .command("_default", MockResponse::output(&output))
+                .write(&bin);
+            let activity = terminals::load(now(), true).unwrap();
+            assert!(!activity.unknown);
+            assert_eq!(
+                activity.processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                [parent as u32]
+            );
+            let busy = terminals::busy_for(&dir, &activity).unwrap();
+            assert!(!busy.unknown);
+            assert_eq!(busy.processes.len(), 1);
+            assert_eq!(mock_calls(&dir, "lsof").len(), 1);
+            // A per-process cwd error is harmless; malformed ancestry is not.
+            for malformed in [
+                output.replace("R1\n", "Rinvalid\n"),
+                output.replace("R1\n", ""),
+            ] {
+                MockConfig::new("lsof")
+                    .command("_default", MockResponse::output(&malformed))
+                    .write(&bin);
+                assert!(terminals::load(now(), true).unwrap().unknown);
+            }
         }
         #[cfg(unix)]
         "processes" => {
