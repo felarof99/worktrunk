@@ -13,7 +13,7 @@
 //! the JSON. The lock stays on disk: unlinking it would split concurrent locks.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -139,38 +139,72 @@ fn marks_path(repo: &Repository, identity: &Path) -> anyhow::Result<Option<PathB
 }
 
 fn create_state(repo: &Repository, identity: &Path) -> anyhow::Result<PathBuf> {
-    let parent = identity
-        .parent()
-        .context("Cleanup identity has no parent directory")?;
-    create_state_dir(parent)?;
-    // The temporary pointer belongs to this admin directory before publishing.
-    // If removal deletes it, publication fails instead of recreating it.
-    let pointer = tempfile::NamedTempFile::new_in(parent)?;
-    create_state_dir(&repo.wt_dir())?;
-    let store = repo.wt_dir().join("clean");
-    create_state_dir(&store)?;
-    let generation = tempfile::Builder::new()
-        .prefix("worktree-")
-        .tempdir_in(&store)?;
-    let id = generation
-        .path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Invalid cleanup state directory name")?;
-    let path = generation.path().join("marks.json");
-    write_atomically(&path, &serde_json::to_string(&Marks::default())?)?;
-    write_atomically(pointer.path(), &serde_json::to_string(id)?)?;
-    match pointer.persist_noclobber(identity) {
-        Ok(_) => {
-            let _ = generation.keep();
-            Ok(path)
+    PendingState::prepare(repo, identity)?.publish(repo, identity)
+}
+
+/// Own unpublished files until an identity has been published or another first
+/// writer won. Dropping a failed preparation removes only its scratch state.
+struct PendingState {
+    pointer: tempfile::NamedTempFile,
+    generation: tempfile::TempDir,
+}
+
+impl PendingState {
+    fn prepare(repo: &Repository, identity: &Path) -> anyhow::Result<Self> {
+        let parent = identity
+            .parent()
+            .context("Cleanup identity has no parent directory")?;
+        create_state_dir(parent)?;
+        let pointer = tempfile::NamedTempFile::new_in(parent)?;
+        create_state_dir(&repo.wt_dir())?;
+        let store = repo.wt_dir().join("clean");
+        create_state_dir(&store)?;
+        let generation = tempfile::Builder::new()
+            .prefix("worktree-")
+            .tempdir_in(&store)?;
+        write_atomically(
+            &generation.path().join("marks.json"),
+            &serde_json::to_string(&Marks::default())?,
+        )?;
+        Ok(Self {
+            pointer,
+            generation,
+        })
+    }
+
+    fn publish(mut self, repo: &Repository, identity: &Path) -> anyhow::Result<PathBuf> {
+        let id = self
+            .generation
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Invalid cleanup state directory name")?;
+        let path = self.generation.path().join("marks.json");
+        // This is an unpublished, empty scratch file. Write its open handle:
+        // replacing its pathname could resurrect it in a replacement worktree
+        // after the original admin directory was deleted. Publication below
+        // is atomic and never overwrites an existing identity.
+        self.pointer.write_all(&serde_json::to_vec(id)?)?;
+        self.pointer.as_file().sync_all()?;
+        match self.pointer.persist_noclobber(identity) {
+            Ok(_) => {
+                let _ = self.generation.keep();
+                Ok(path)
+            }
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+                let winner =
+                    marks_path(repo, identity)?.context("Worktree cleanup identity disappeared")?;
+                // Read the winner BEFORE checking our unique scratch pointer.
+                // A replaced admin directory cannot pass this check and make
+                // its new identity look like a competing first writer's ID.
+                anyhow::ensure!(
+                    load_json::<String>(error.file.path())?.as_deref() == Some(id),
+                    "Worktree changed during cleanup state initialization"
+                );
+                Ok(winner)
+            }
+            Err(error) => Err(error.error).context("Failed to create worktree cleanup identity"),
         }
-        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
-            // Another first writer won. This unpublished directory is dropped;
-            // both writers subsequently lock the winning generation's file.
-            marks_path(repo, identity)?.context("Worktree cleanup identity disappeared")
-        }
-        Err(error) => Err(error.error).context("Failed to create worktree cleanup identity"),
     }
 }
 
@@ -368,6 +402,36 @@ mod tests {
                 "obsolete update should report the replaced worktree"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_first_writers_refuse_a_replaced_worktree() {
+        let mut fixture = TestRepo::with_initial_commit();
+        let path = fixture.add_worktree("old");
+        let repo = Repository::at(fixture.root_path()).unwrap();
+        let identity = identity_path(&repo, &path).unwrap();
+        let pending = PendingState::prepare(&repo, &identity).unwrap();
+        assert!(
+            !identity.exists(),
+            "the old worktree has no published identity yet"
+        );
+        fixture.run_git(&["worktree", "remove", path.to_str().unwrap()]);
+        fixture.run_git(&[
+            "worktree",
+            "add",
+            "-b",
+            "replacement",
+            path.to_str().unwrap(),
+        ]);
+        set_pin(&repo, &path, true).unwrap();
+        let before = fs::read(&identity).unwrap();
+        assert!(
+            pending.publish(&repo, &identity).is_err(),
+            "an obsolete first writer must not adopt the replacement identity"
+        );
+        assert_eq!(fs::read(&identity).unwrap(), before);
+        assert_marks(&repo, &path, true, false);
     }
 
     #[test]
