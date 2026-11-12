@@ -14,6 +14,7 @@ pub mod cache_sharing;
 pub mod ci_status;
 pub mod clean_attic;
 pub mod clean_facts;
+pub mod clean_policy;
 pub mod clean_skeleton;
 pub mod completion;
 pub mod completion_validation;
