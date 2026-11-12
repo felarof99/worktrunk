@@ -1,8 +1,10 @@
+mod clean;
 mod config;
 mod hook;
 mod list;
 mod step;
 
+pub(crate) use clean::CleanCommand;
 pub(crate) use config::{
     ApprovalsCommand, CacheAction, CiStatusAction, ConfigAliasCommand, ConfigCommand,
     ConfigPluginsClaudeCommand, ConfigPluginsCodexCommand, ConfigPluginsCommand,
@@ -1462,6 +1464,14 @@ lint = "cargo clippy"
 "#
     )]
     Merge(MergeArgs),
+
+    /// Back up and clean worktrees
+    #[command(arg_required_else_help = true, after_long_help = clean::CLEAN_HELP)]
+    Clean {
+        #[command(subcommand)]
+        action: CleanCommand,
+    },
+
     /// Deprecated: use `wt switch` instead
     ///
     /// Interactive worktree picker (now integrated into `wt switch`).

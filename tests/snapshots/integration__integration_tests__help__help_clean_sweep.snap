@@ -1,0 +1,97 @@
+---
+source: tests/integration_tests/help.rs
+info:
+  program: wt
+  args:
+    - clean
+    - sweep
+    - "--help"
+  env:
+    CLICOLOR_FORCE: "1"
+    COLUMNS: "500"
+    GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
+    LANG: C
+    LC_ALL: C
+    LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
+    TERM: alacritty
+    WORKTRUNK_APPROVALS_PATH: "[TEST_APPROVALS]"
+    WORKTRUNK_CONFIG_PATH: "[TEST_CONFIG]"
+    WORKTRUNK_SYSTEM_CONFIG_PATH: "[TEST_SYSTEM_CONFIG]"
+    WORKTRUNK_TEST_BASH_INSTALLED: "0"
+    WORKTRUNK_TEST_CLAUDE_INSTALLED: "0"
+    WORKTRUNK_TEST_CODEX_INSTALLED: "0"
+    WORKTRUNK_TEST_DELAYED_STREAM_MS: "-1"
+    WORKTRUNK_TEST_EPOCH: "1735776000"
+    WORKTRUNK_TEST_FISH_INSTALLED: "0"
+    WORKTRUNK_TEST_GEMINI_INSTALLED: "0"
+    WORKTRUNK_TEST_NUSHELL_ENV: "0"
+    WORKTRUNK_TEST_OPENCODE_INSTALLED: "0"
+    WORKTRUNK_TEST_PARENT_SHELL: ""
+    WORKTRUNK_TEST_POWERSHELL_ENV: "0"
+    WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
+    WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
+    WORKTRUNK_TEST_ZSH_INSTALLED: "0"
+---
+success: true
+exit_code: 0
+----- stdout -----
+wt clean sweep - Back up and remove inactive worktrees
+
+Usage: [1m[36mwt clean sweep[0m [36m[OPTIONS][0m
+
+[1m[32mOptions:[0m
+      [1m[36m--all-repos[0m
+          Include registered and discovered repos
+
+      [1m[36m--root[0m[36m [0m[36m<DIR>[0m
+          Discovery root for --all-repos (repeatable)
+
+      [1m[36m--dry-run[0m
+          Preview without changing anything
+
+  [1m[36m-h[0m, [1m[36m--help[0m
+          Print help (see a summary with '-h')
+
+[1m[32mAutomation:[0m
+      [1m[36m--format[0m[36m [0m[36m<FORMAT>[0m
+          Output format
+          
+          [default: text]
+          [possible values: text, json]
+
+[1m[32mGlobal Options:[0m
+  [1m[36m-C[0m[36m [0m[36m<path>[0m
+          Working directory for this command
+
+      [1m[36m--config[0m[36m [0m[36m<path>[0m
+          User config file path
+
+      [1m[36m--config-set[0m[36m [0m[36m<toml>[0m
+          Override config with inline TOML, e.g. --config-set list.full=true (repeatable)
+
+  [1m[36m-v[0m, [1m[36m--verbose[0m[36m...[0m
+          Verbose output (-v: info logs + hook/alias template variables on stderr; -vv: also debug logs and raw subprocess output written to .git/wt/logs/). Set WORKTRUNK_VERBOSE=0|1|2 to apply the same level everywhere — including shell completion, which no flag can reach
+
+  [1m[36m-y[0m, [1m[36m--yes[0m
+          Skip approval prompts
+
+Not implemented yet. The planned sweep keeps primary and pinned worktrees. A worktree silent for at least 7 days is removed after ending its non-working hc terminals. Otherwise, busy worktrees are kept, remove-requested worktrees are removed, and untouched worktrees are removed after 24 hours.
+
+Busy means a live process has its working directory inside the worktree, or a live hc terminal was launched inside it. Last touch is the newest timestamp of the worktree's index, HEAD, logs/HEAD, and changed or untracked files. Silent means last touch is at least 7 days old and every hc terminal is not working and has not advanced its turn in 7 days. A newly observed terminal has no such history yet.
+
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--dry-run[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--all-repos[0m[2m [0m[2m[36m--root[0m[2m ~/code [0m[2m[36m--root[0m[2m ~/work[0m
+
+[2m--all-repos[0m covers the registry of repos where any [2mwt clean[0m command has run, plus repos owning linked worktrees found up to two folders below each [2m--root[0m. Repos with unreachable primary worktrees are skipped and reported. Attic entries older than 30 days are deleted, except during a dry run.
+
+Kept worktrees are normal results. Exit status is 0 unless the sweep itself fails.
+
+----- stderr -----

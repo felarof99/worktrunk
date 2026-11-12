@@ -14,6 +14,8 @@ use commands::hooks::HookAnnouncer;
 
 mod cli;
 mod commands;
+// TODO(clean): public skeleton interfaces used by pieces A–F.
+pub use commands::clean;
 mod completion;
 mod diagnostic;
 mod display;
@@ -927,6 +929,7 @@ fn dispatch_command(
 ) -> anyhow::Result<()> {
     match command {
         Commands::Config { action } => handle_config_command(action, yes),
+        Commands::Clean { action } => commands::clean::dispatch(action, yes),
         Commands::Step { action } => handle_step_command(action, working_dir, yes),
         Commands::Hook { action } => handle_hook_command(action, yes),
         Commands::Select { branches, remotes } => handle_select_command(branches, remotes),

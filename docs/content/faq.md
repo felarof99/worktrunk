@@ -175,6 +175,8 @@ None of this is tracked by git or pushed to remotes.
 
 Worktrunk can delete **worktrees** and **branches**. Both have safeguards.
 
+`wt clean` is currently a skeleton and deletes nothing. Its planned cleanup backs up commits remotely and uncommitted work locally before removing worktrees and branches; sweeps also expire local attic entries older than 30 days.
+
 ### Worktree removal
 
 `wt remove` mirrors `git worktree remove`: it refuses to remove worktrees with uncommitted changes (staged, modified, or untracked files). The `--force` flag removes the worktree anyway, discarding all of those changes.

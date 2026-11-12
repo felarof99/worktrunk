@@ -15,6 +15,7 @@ with many parallel changes, including hooks to automate local workflows.
 - [wt list](https://worktrunk.dev/list.md): List worktrees and their status.
 - [wt remove](https://worktrunk.dev/remove.md): Remove worktree; delete branch if merged. Defaults to the current worktree.
 - [wt merge](https://worktrunk.dev/merge.md): Merge current branch into the target branch. Squash & rebase, fast-forward the target branch, remove the worktree.
+- [wt clean](https://worktrunk.dev/clean.md): Back up and clean worktrees.
 - [wt config](https://worktrunk.dev/config.md): Manage user & project configs. Includes shell integration, hooks, and saved state.
 - [wt step](https://worktrunk.dev/step.md): Run individual operations. The building blocks of wt merge — commit, squash, rebase, push — plus standalone utilities.
 - [wt hook](https://worktrunk.dev/hook.md): Run configured hooks.
