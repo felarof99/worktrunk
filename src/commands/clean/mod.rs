@@ -100,8 +100,9 @@
 //! # hc, registry, attic, and restore
 //!
 //! hc is optional: absent from PATH means no terminals. `hc ls --json` returns
-//! an array with `address`, launch `cwd`, optional status (`working`, `blocked`,
-//! `done`, `idle`), and `turn`. User-level history stores each address's last
+//! an object with a `terminals` array: `address`, launch `cwd`, `state`, optional
+//! status (`working`, `blocked`, `done`, `idle`, `error`, or null), and `turn`.
+//! Unknown status words mean working. User-level history stores each address's last
 //! observed turn and when it changed. A terminal first seen today has no
 //! seven-day history. Only sweep's silent-seven-days rule may end terminals,
 //! using `hc kill <address>` then `hc rm <address>`; never end a working one.
@@ -222,6 +223,7 @@ pub enum TerminalStatus {
     Blocked,
     Done,
     Idle,
+    Error,
 }
 
 // TODO(clean): used by piece A.
