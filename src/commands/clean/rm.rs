@@ -1,4 +1,4 @@
-//! Piece E: explicit removal, shared backup-then-delete path, and delayed requests.
+//! Piece E: explicit removal, shared backup-then-delete path, delay, and waiting.
 
 use std::time::Duration;
 
@@ -8,11 +8,13 @@ use super::{CleanRow, RemoteSnapshot, RemovalOptions, Timestamp, Verdict, Worktr
 
 /// Resolve branches through Repository::resolve_worktree, defaulting to the
 /// current worktree, and apply the rm policy. Back up busy requests before
-/// deferring, honor delay and preview modes, and fail if any worktree is refused
-/// or its backup fails. All work is still unimplemented in the skeleton.
+/// deferring, honor detached delay, foreground wait, and preview modes, and fail
+/// if any worktree is refused or its backup fails. A foreground wait that expires
+/// while busy uses normal backup and deferral. All work is still unimplemented.
 pub(crate) fn run(
     _branches: Vec<String>,
     _after: Option<Duration>,
+    _wait: Option<Duration>,
     _dry_run: bool,
     _format: crate::cli::SwitchFormat,
     _yes: bool,

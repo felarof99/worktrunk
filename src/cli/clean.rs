@@ -12,6 +12,7 @@ pub(super) const CLEAN_HELP: &str = r#"These commands are not implemented yet. T
 ```console
 $ wt clean rm feature/auth
 $ wt clean rm feature/auth --after 10m
+$ wt clean rm feature/auth --wait 5s
 $ wt clean sweep --dry-run
 $ wt clean sweep --all-repos --root ~/code --format json
 $ wt clean keep feature/auth
@@ -47,9 +48,12 @@ pub(crate) enum CleanCommand {
 $ wt clean rm feature/auth
 $ wt clean rm feature/auth old-fix --dry-run
 $ wt clean rm feature/auth --after 10m
+$ wt clean rm feature/auth --wait 5s
 ```
 
 With `--after`, a detached process waits and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it does nothing.
+
+With `--wait`, the command stays in the foreground for up to the given duration until the worktree stops being busy, then backs up and removes it. If it is still busy when the wait ends, normal backup and deferral apply, with exit status 0.
 
 Exit status is 0 when every worktree is removed or deferred, and 1 when any worktree is refused or its backup fails. A deferred worktree goes when nothing runs in it.
 "#
@@ -64,6 +68,12 @@ Exit status is 0 when every worktree is removed or deferred, and 1 when any work
         /// Return immediately; examples: 10m, 1h, 1d.
         #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
         after: Option<Duration>,
+
+        /// Wait in foreground until idle
+        ///
+        /// Wait at most this long, then defer if still busy; examples: 5s, 1m.
+        #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+        wait: Option<Duration>,
 
         /// Preview without changing anything
         #[arg(long)]

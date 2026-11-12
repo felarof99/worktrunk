@@ -78,6 +78,7 @@ These commands are not implemented yet. The rules below describe the planned com
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--after[0m[2m 10m[0m
+[107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--wait[0m[2m 5s[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--dry-run[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--all-repos[0m[2m [0m[2m[36m--root[0m[2m ~/code [0m[2m[36m--format[0m[2m json[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean keep feature/auth[0m

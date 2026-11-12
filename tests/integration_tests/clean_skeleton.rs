@@ -30,6 +30,7 @@ fn tests_that_clean_skeleton_accepts_flags_and_returns_an_error() {
     // Replace this skeleton-only contract as pieces C–F implement the handlers.
     let cases: &[&[&str]] = &[
         &["rm"],
+        &["rm", "feature/auth", "--wait", "5s"],
         &[
             "rm",
             "feature/auth",

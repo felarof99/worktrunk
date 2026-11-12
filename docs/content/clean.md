@@ -15,7 +15,7 @@ These commands are not implemented yet. The rules below describe the planned com
 
 ## Examples
 
-{{ terminal(cmd="wt clean rm feature/auth|||wt clean rm feature/auth --after 10m|||wt clean sweep --dry-run|||wt clean sweep --all-repos --root ~/code --format json|||wt clean keep feature/auth|||wt clean keep feature/auth --off|||wt clean restore feature/auth") }}
+{{ terminal(cmd="wt clean rm feature/auth|||wt clean rm feature/auth --after 10m|||wt clean rm feature/auth --wait 5s|||wt clean sweep --dry-run|||wt clean sweep --all-repos --root ~/code --format json|||wt clean keep feature/auth|||wt clean keep feature/auth --off|||wt clean restore feature/auth") }}
 
 ## Worktrees and backups
 
@@ -75,9 +75,11 @@ Back up and remove worktrees.
 
 Not implemented yet. The planned command refuses primary and pinned worktrees. A busy worktree is backed up now and marked for removal when nothing runs in it; the calling process counts as busy. To unpin a worktree, run `wt clean keep --off` for that branch.
 
-{{ terminal(cmd="wt clean rm feature/auth|||wt clean rm feature/auth old-fix --dry-run|||wt clean rm feature/auth --after 10m") }}
+{{ terminal(cmd="wt clean rm feature/auth|||wt clean rm feature/auth old-fix --dry-run|||wt clean rm feature/auth --after 10m|||wt clean rm feature/auth --wait 5s") }}
 
 With `--after`, a detached process waits and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it does nothing.
+
+With `--wait`, the command stays in the foreground for up to the given duration until the worktree stops being busy, then backs up and removes it. If it is still busy when the wait ends, normal backup and deferral apply, with exit status 0.
 
 Exit status is 0 when every worktree is removed or deferred, and 1 when any worktree is refused or its backup fails. A deferred worktree goes when nothing runs in it.
 
@@ -97,6 +99,11 @@ Usage: <b><span class=c>wt clean rm</span></b> <span class=c>[OPTIONS]</span> <s
           Delay removal, then recheck activity
 
           Return immediately; examples: 10m, 1h, 1d.
+
+      <b><span class=c>--wait</span></b><span class=c> &lt;DURATION&gt;</span>
+          Wait in foreground until idle
+
+          Wait at most this long, then defer if still busy; examples: 5s, 1m.
 
       <b><span class=c>--dry-run</span></b>
           Preview without changing anything

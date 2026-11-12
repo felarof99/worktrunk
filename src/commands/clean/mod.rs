@@ -4,7 +4,7 @@
 //!
 //! # Addressing and observations
 //!
-//! `wt clean rm [BRANCH]... [--after DURATION] [--dry-run] [--format text|json]`,
+//! `wt clean rm [BRANCH]... [--after DURATION] [--wait DURATION] [--dry-run] [--format text|json]`,
 //! `sweep [--all-repos] [--root DIR]... [--dry-run] [--format text|json]`,
 //! `keep [BRANCH] [--off]`, and `restore <BRANCH>` form the fixed CLI. Global
 //! `-C` and `-y` retain their usual meaning. Worktree names go through
@@ -88,7 +88,11 @@
 //!
 //! `--after` returns immediately and spawns a detached waiter. After the delay
 //! it removes only if the worktree is not busy and has not been touched since
-//! the request; otherwise it does nothing. `--dry-run` prints every verdict
+//! the request; otherwise it does nothing. `--wait` stays in the foreground
+//! for up to the supplied duration until the worktree stops being busy, then
+//! backs up and removes it. If still busy at expiry, apply normal backup and
+//! deferral with exit 0. This lets Herdr's Remove dialog wait for programs
+//! that are still exiting after a space closes. `--dry-run` prints every verdict
 //! and reason without any changes (including marks, registry/history writes,
 //! terminal termination, delayed jobs, or attic expiry). It may `ls-remote`
 //! but never pushes. Network detail must not gate the first terminal output.
@@ -131,7 +135,7 @@
 //! | `policy.rs` | D | pure verdict tables |
 //! | `keep.rs` | D | pins, remove-requested marks, keep command |
 //! | `registry.rs` | D | registry and root discovery |
-//! | `rm.rs` | E | rm command, shared remove-one path, delay |
+//! | `rm.rs` | E | rm command, shared remove-one path, detached delay, foreground wait |
 //! | `sweep.rs` | F | sweep command |
 //!
 //! Each piece owns `tests/integration_tests/clean_<piece>.rs`. Tests use temp
@@ -336,9 +340,10 @@ pub(crate) fn dispatch(command: CleanCommand, yes: bool) -> anyhow::Result<()> {
         CleanCommand::Rm {
             branches,
             after,
+            wait,
             dry_run,
             format,
-        } => rm::run(branches, after, dry_run, format, yes),
+        } => rm::run(branches, after, wait, dry_run, format, yes),
         CleanCommand::Sweep {
             all_repos,
             roots,
