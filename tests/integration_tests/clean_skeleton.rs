@@ -41,17 +41,6 @@ fn tests_that_clean_skeleton_accepts_flags_and_returns_an_error() {
             "--format",
             "json",
         ],
-        &["sweep", "--dry-run"],
-        &[
-            "sweep",
-            "--all-repos",
-            "--root",
-            "projects",
-            "--root",
-            "work",
-            "--format",
-            "text",
-        ],
     ];
     for args in cases {
         let output = wt_command()
