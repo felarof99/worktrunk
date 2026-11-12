@@ -42,7 +42,6 @@ pub struct SkippedRepository {
     pub reason: String,
 }
 
-// TODO(clean): used by pieces C, D, E, and F, except dry runs.
 /// Register the current repo in user-level state whenever a clean command
 /// runs. Preserve existing entries and use the repo's atomic-write conventions;
 /// dry runs consult the registry without registering or otherwise changing it.
@@ -50,7 +49,6 @@ pub fn register(repo: &Repository) -> anyhow::Result<()> {
     register_at(repo, &registry_path()?)
 }
 
-// TODO(clean): used by piece F.
 /// Select the current repo, or with all_repos combine registered repos and
 /// owners of linked worktrees found at most two folders below each root.
 /// Deduplicate repos; unreachable primary worktrees are skipped and reported,

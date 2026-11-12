@@ -60,7 +60,6 @@ fn probe_timeout() -> Duration {
     )
 }
 
-// TODO(clean): used by pieces E and F.
 /// Load live process working directories and `hc ls --json` launch directories,
 /// joining terminals with their stored turn history at the supplied time. With
 /// no hc on PATH, terminals are empty; unknown process activity stays busy.
@@ -134,7 +133,6 @@ pub fn load(now: Timestamp, dry_run: bool) -> anyhow::Result<ActivitySnapshot> {
     })
 }
 
-// TODO(clean): used by pieces A, E, and F.
 /// Select processes whose cwd and live terminals whose launch cwd lie inside
 /// this worktree. This is a pure path-membership operation on an observation;
 /// unknown activity must remain unknown rather than become an empty busy set.
@@ -165,7 +163,6 @@ pub fn busy_for(path: &Path, activity: &ActivitySnapshot) -> anyhow::Result<Busy
     })
 }
 
-// TODO(clean): used by pieces E and F.
 /// End only terminals selected by the silent-seven-days sweep verdict, with
 /// `hc kill` followed by `hc rm`. A working terminal must never be ended;
 /// callers must retain that protection when observations become stale.

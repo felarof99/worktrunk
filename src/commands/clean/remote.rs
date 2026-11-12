@@ -85,7 +85,6 @@ fn parse_snapshot(remote: String, advertisement: &str) -> anyhow::Result<RemoteS
     })
 }
 
-// TODO(clean): used by pieces E and F.
 /// Select the repo's primary remote and capture its advertised refs once per
 /// run. No remote fails with "no remote"; discovery must not block the first
 /// local progress output. Later confirmations query only the pushed backup ref.
@@ -100,7 +99,6 @@ pub fn fetch_snapshot(repo: &Repository) -> anyhow::Result<RemoteSnapshot> {
     parse_snapshot(remote, &advertisement)
 }
 
-// TODO(clean): used by piece B and dry-run paths in pieces E and F.
 /// Test whether the exact tip is advertised, or is an ancestor of the advertised
 /// default-branch tip whose object is local. This reads only the snapshot and
 /// local git objects; it never fetches an object to prove ancestry.
@@ -149,7 +147,6 @@ pub fn tip_on_remote(
     }
 }
 
-// TODO(clean): used by pieces E and F, never during dry-run.
 /// Confirm an already-advertised tip or force-push it to the branch's wt-backup
 /// ref and verify that ref with ls-remote. Detached heads use their worktree
 /// folder name and first twelve tip SHA characters, so equal folder names do
@@ -162,24 +159,17 @@ pub fn backup(
     if tip_on_remote(repo, facts, snapshot)? {
         return Ok(BackupResult::OnRemote);
     }
-    let branch = match &facts.branch {
-        Some(branch) => branch.clone(),
-        None => {
-            let folder = facts
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("Detached worktree has no UTF-8 folder name")?;
-            format!("detached-{folder}-{}", &facts.tip_sha[..12])
+    let reference = match backup_reference(repo, facts) {
+        Ok(reference) => reference,
+        Err(error) => {
+            if let Some(signal) = error.interrupt_signal() {
+                return Err(WorktrunkError::Interrupted { signal, hint: None }.into());
+            }
+            return Ok(BackupResult::Failed {
+                reason: error.to_string(),
+            });
         }
     };
-    let reference = format!("refs/heads/wt-backup/{branch}");
-    if !repo.run_command_check(&["check-ref-format", &reference])? {
-        return Ok(BackupResult::Failed {
-            reason: "Invalid backup branch name; rename the branch or detached worktree folder"
-                .into(),
-        });
-    }
     let refspec = format!("{}:{reference}", facts.tip_sha);
     if let Err(error) = remote_command(
         repo,
@@ -216,6 +206,29 @@ pub fn backup(
         });
     }
     Ok(BackupResult::Pushed { reference })
+}
+
+/// Resolve and validate the exact push destination for both backup and preview.
+pub(super) fn backup_reference(repo: &Repository, facts: &WorktreeFacts) -> anyhow::Result<String> {
+    if !is_object_id(&facts.tip_sha) {
+        bail!("Invalid worktree tip; read the worktree again");
+    }
+    let branch = match &facts.branch {
+        Some(branch) => branch.clone(),
+        None => {
+            let folder = facts
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("Detached worktree has no UTF-8 folder name")?;
+            format!("detached-{folder}-{}", &facts.tip_sha[..12])
+        }
+    };
+    let reference = format!("refs/heads/wt-backup/{branch}");
+    if !repo.run_command_check(&["check-ref-format", &reference])? {
+        bail!("Invalid backup branch name; rename the branch or detached worktree folder");
+    }
+    Ok(reference)
 }
 
 fn failed_operation(

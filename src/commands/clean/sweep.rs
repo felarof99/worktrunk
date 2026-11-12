@@ -13,13 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Context;
-use color_print::cformat;
 use worktrunk::git::{ErrorExt, Repository, WorktrunkError, resolve_input_path};
 use worktrunk::path::format_path_for_display;
 use worktrunk::shell_exec::INHERITED_GIT_PATH_VARS;
 use worktrunk::styling::{
-    eprintln, format_heading, info_message, println, progress_message, success_message,
-    warning_message,
+    eprintln, format_heading, info_message, println, progress_message, warning_message,
 };
 
 use super::{
@@ -80,9 +78,9 @@ fn run_with_remover(
     eprintln!(
         "{}",
         progress_message(if options.dry_run {
-            "Inspecting worktrees (--dry-run)..."
+            "Checking worktrees (--dry-run)..."
         } else {
-            "Inspecting worktrees..."
+            "Checking worktrees..."
         })
     );
     let activity = terminals::load(now, options.dry_run)?;
@@ -110,7 +108,7 @@ fn run_with_remover(
             }
             sweep_repository(&repo, &activity, options, now, remove, |row| {
                 if matches!(format, SwitchFormat::Text) {
-                    text_line(render_row(row), options.dry_run);
+                    rm::print_row(row, options.dry_run);
                 }
             })
         })();
@@ -246,24 +244,6 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn render_row(row: &CleanRow) -> String {
-    let verdict = match row.verdict {
-        OutputVerdict::Removed => "removed",
-        OutputVerdict::Kept => "kept",
-        OutputVerdict::Deferred => "deferred",
-        OutputVerdict::WouldRemove => "would-remove",
-    };
-    let branch = one_line(row.branch.as_deref().unwrap_or("detached HEAD"));
-    let path = one_line(&format_path_for_display(&row.path));
-    let reason = one_line(&row.reason);
-    let message = cformat!("<bold>{verdict}</> <bold>{branch}</> @ {path} ({reason})");
-    if row.verdict == OutputVerdict::Removed {
-        success_message(message).to_string()
-    } else {
-        info_message(message).to_string()
-    }
-}
-
 fn text_line(line: String, dry_run: bool) {
     if dry_run {
         println!("{line}");
@@ -331,7 +311,7 @@ fn summary(rows: &[CleanRow], dry_run: bool) -> String {
         .map(|(label, count)| format!("{count} {label}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let action = if dry_run { "would-remove" } else { "removed" };
+    let action = if dry_run { "Would remove" } else { "Removed" };
     let mut message = format!("{action} {removed}, kept {kept}");
     if !reasons.is_empty() {
         message.push_str(&format!(" ({reasons})"));
@@ -730,12 +710,12 @@ mod tests {
                 attic: None,
             }));
         }
-        assert_snapshot!(summary(&rows, false), @"removed 31, kept 6 (4 in use, 1 recent, 1 backup failed)");
+        assert_snapshot!(summary(&rows, false), @r"Removed 31, kept 6 (4 in use, 1 recent, 1 backup failed)");
         for row in &mut rows {
             if row.verdict == OutputVerdict::Removed {
                 row.verdict = OutputVerdict::WouldRemove;
             }
         }
-        assert_snapshot!(summary(&rows, true), @"would-remove 31, kept 6 (4 in use, 1 recent, 1 backup failed)");
+        assert_snapshot!(summary(&rows, true), @r"Would remove 31, kept 6 (4 in use, 1 recent, 1 backup failed)");
     }
 }

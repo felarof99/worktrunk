@@ -17,7 +17,6 @@ use worktrunk::path::format_path_for_display;
 
 use super::{BusyState, KeepState, Timestamp, WorktreeFacts};
 
-// TODO(clean): used by pieces E and F.
 /// Load primary/bare status, pins, removal marks, lock, tip, exact porcelain
 /// status, and last touch from admin files and changed/untracked paths. Attach
 /// the supplied activity observation; failures must preserve the worktree.

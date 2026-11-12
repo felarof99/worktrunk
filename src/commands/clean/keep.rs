@@ -59,7 +59,6 @@ pub fn run(branch: Option<&str>, off: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-// TODO(clean): used by piece A.
 /// Load a worktree's pin and remove-requested mark without writing anything.
 /// Absent marks mean false; unreadable state is an error rather than permission
 /// to remove a possibly pinned worktree.
@@ -75,7 +74,6 @@ pub fn load_state(repo: &Repository, worktree: &Path) -> anyhow::Result<KeepStat
     })
 }
 
-// TODO(clean): used by piece D's keep command.
 /// Set or clear this worktree's pin while preserving other worktrees' marks
 /// and this worktree's remove-requested state. The pin protects both rm and
 /// sweep, including sweep's silent-seven-days rule.
@@ -83,7 +81,6 @@ pub fn set_pin(repo: &Repository, worktree: &Path, pinned: bool) -> anyhow::Resu
     update(repo, worktree, |marks| marks.pinned = pinned)
 }
 
-// TODO(clean): used by pieces E and F.
 /// Set the removal mark only after backing up a busy rm request, or clear it
 /// after completed removal. Preserve pins and unrelated worktree state; this
 /// operation must never run as part of a dry-run preview.

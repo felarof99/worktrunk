@@ -14,7 +14,6 @@ use commands::hooks::HookAnnouncer;
 
 mod cli;
 mod commands;
-// TODO(clean): public skeleton interfaces used by pieces A–F.
 pub use commands::clean;
 mod completion;
 mod diagnostic;

@@ -71,7 +71,7 @@ Usage: [1m[36mwt clean restore[0m [36m[OPTIONS][0m [36m<BRANCH>[0m
   [1m[36m-y[0m, [1m[36m--yes[0m
           Skip approval prompts
 
-Not implemented yet. The planned restore uses the local branch if present, otherwise [2m<remote>/<branch>[0m, otherwise [2m<remote>/wt-backup/<branch>[0m (fetching that one ref). It re-applies the newest attic entry, if any, then prints the worktree path.
+Restore uses the local branch if present, otherwise [2m<remote>/<branch>[0m, otherwise [2m<remote>/wt-backup/<branch>[0m (fetching that one ref). It re-applies the newest attic entry, if any, then prints the absolute worktree path. Existing worktrees are left in place. Restore refuses to overwrite local files or tracked changes, and retains the attic entry after success or failure. Creation follows the usual path configuration and hook approvals.
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean restore feature/auth[0m
 

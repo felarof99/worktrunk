@@ -690,6 +690,8 @@ exec {} "$@"
 #[test]
 fn tests_that_clean_rm_keeps_a_branch_checked_out_during_removal() {
     let f = Fixture::new();
+    let post = f.bin.join("post");
+    f.project(&format!("post-remove = 'touch {}'\n", post.display()));
     let git = which::which("git").unwrap();
     let replacement = f.repo.home_path().join("concurrent-checkout");
     let wrapper = f.bin.join("git");
@@ -712,7 +714,7 @@ exec {} "$@"
     )
     .unwrap();
     fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-    let rows = f.json(&["feature"], 1);
+    let rows = f.json(&["feature", "-y"], 1);
     assert_eq!(rows[0]["verdict"], "kept");
     assert!(
         rows[0]["reason"]
@@ -721,6 +723,14 @@ exec {} "$@"
             .contains("local branch kept")
     );
     assert!(replacement.join("file.txt").exists() && f.exists_branch());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !post.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        post.exists(),
+        "post-remove must run after the worktree is removed"
+    );
 }
 
 #[test]
@@ -750,8 +760,22 @@ fn tests_that_clean_rm_unknown_activity_never_authorizes_deletion() {
 #[test]
 fn tests_that_clean_rm_after_runs_outside_the_current_worktree() {
     let f = Fixture::new();
+    let cwd = f.bin.join("spawn-cwd");
+    let shell = which::which("sh").unwrap();
+    let wrapper = f.bin.join("sh");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\npwd > {}\nexec {} \"$@\"\n",
+            quote(&cwd),
+            quote(&shell)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     rows(
         f.command()
+            .current_dir(&f.path)
             .args([
                 "-C",
                 f.path.to_str().unwrap(),
@@ -767,6 +791,10 @@ fn tests_that_clean_rm_after_runs_outside_the_current_worktree() {
         0,
     );
     wait_for_file_content(&f.log());
+    assert_eq!(
+        dunce::canonicalize(fs::read_to_string(cwd).unwrap().trim()).unwrap(),
+        f.repo.path()
+    );
     assert!(!f.path.exists() && !f.exists_branch());
 }
 
@@ -842,7 +870,7 @@ fn tests_that_clean_rm_after_refuses_primary_and_pin_before_scheduling() {
 fn tests_that_clean_rm_rejects_after_with_wait() {
     let f = Fixture::new();
     let output = f.rm(&["feature", "--after", "1s", "--wait", "1s"]);
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--after"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--wait"));
     assert!(f.path.exists());
@@ -854,13 +882,203 @@ fn tests_that_clean_rm_text_reports_backup_removal_and_preview() {
     let _settings = setup_snapshot_settings(&f.repo).bind_to_scope();
     let preview = f.rm(&["feature", "--dry-run"]);
     assert!(preview.status.success(), "{preview:?}");
-    assert_snapshot!(String::from_utf8_lossy(&preview.stdout), @r"○ Would remove worktree @ _REPO_.feature: backup before removal");
+    assert_snapshot!(String::from_utf8_lossy(&preview.stdout), @r"○ Would remove worktree @ _REPO_.feature: on remote");
     let removed = f.rm(&["feature"]);
     assert!(removed.status.success(), "{removed:?}");
     assert!(removed.stdout.is_empty());
     assert_snapshot!(String::from_utf8_lossy(&removed.stderr), @r"◎ Checking worktrees...
 ◎ Checking remote backup...
-○ On origin
+○ Commits backed up on origin
 ✓ Removed worktree @ _REPO_.feature
 ✓ Deleted local branch feature");
+}
+
+#[test]
+fn tests_that_clean_rm_allows_ignored_fixture_repositories_but_keeps_untracked_ones() {
+    for ignored in [true, false] {
+        let f = Fixture::new();
+        let nested = f.path.join("target/debug/wt-test-fixtures/x/repo");
+        f.repo
+            .run_git(&["init", "-b", "main", nested.to_str().unwrap()]);
+        f.repo
+            .run_git_in(&nested, &["commit", "--allow-empty", "-m", "fixture"]);
+        fs::write(nested.join(".env.local"), "nested secret").unwrap();
+        if ignored {
+            fs::write(f.repo.path().join(".git/info/exclude"), "target/\n.env*\n").unwrap();
+            fs::write(f.path.join(".env.local"), "worktree secret").unwrap();
+        }
+        let preview = f.json(&["feature", "--dry-run"], if ignored { 0 } else { 1 });
+        assert_eq!(
+            preview[0]["verdict"],
+            if ignored { "would-remove" } else { "kept" }
+        );
+        assert!(!f.repo.home_path().join(".wt-attic").exists());
+        let actual = f.json(&["feature"], if ignored { 0 } else { 1 });
+        if ignored {
+            assert_eq!(actual[0]["verdict"], "removed");
+            let attic = Path::new(actual[0]["attic"].as_str().unwrap());
+            assert_eq!(
+                fs::read(attic.join("ignored-env/.env.local")).unwrap(),
+                b"worktree secret"
+            );
+            assert!(!attic.join("ignored-env/target").exists());
+            assert!(!attic.join("untracked/target").exists());
+            assert!(!f.path.exists());
+        } else {
+            assert_eq!(actual[0]["verdict"], "kept");
+            assert_eq!(preview[0]["reason"], actual[0]["reason"]);
+            assert_eq!(
+                fs::read(nested.join(".env.local")).unwrap(),
+                b"nested secret"
+            );
+        }
+    }
+}
+
+#[test]
+fn tests_that_clean_rm_dry_run_reports_remote_backup_without_pushing() {
+    for unpublished in [false, true] {
+        let f = Fixture::new();
+        if unpublished {
+            f.unique_commit();
+        }
+        let preview = f.json(&["feature", "--dry-run"], 0);
+        assert_eq!(preview[0]["verdict"], "would-remove");
+        if unpublished {
+            assert!(preview[0]["backup"].is_null());
+            assert!(
+                preview[0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("refs/heads/wt-backup/feature")
+            );
+        } else {
+            assert_eq!(preview[0]["backup"], "on-remote");
+        }
+        assert!(
+            f.remote
+                .git_output(&["for-each-ref", "refs/heads/wt-backup"])
+                .is_empty()
+        );
+        assert!(f.path.exists() && f.exists_branch());
+    }
+}
+
+#[test]
+fn tests_that_clean_rm_dry_run_checks_backup_refusals_and_locks() {
+    for obstacle in [
+        "no remote",
+        "attic occupied",
+        "locked",
+        "submodule env",
+        "duplicate checkout",
+    ] {
+        let f = Fixture::new();
+        let _submodule = if obstacle == "submodule env" {
+            let source = TestRepo::with_initial_commit();
+            f.repo.run_git_in(
+                &f.path,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    source.path().to_str().unwrap(),
+                    "sub",
+                ],
+            );
+            f.repo
+                .run_git_in(&f.path, &["commit", "-am", "add submodule"]);
+            f.repo.run_git_in(&f.path, &["push", "origin", "feature"]);
+            fs::write(f.path.join("sub/.gitignore"), ".env*\n").unwrap();
+            f.repo
+                .run_git_in(&f.path.join("sub"), &["add", ".gitignore"]);
+            f.repo
+                .run_git_in(&f.path.join("sub"), &["commit", "-m", "ignore env"]);
+            f.repo
+                .run_git_in(&f.path, &["commit", "-am", "pin submodule"]);
+            f.repo.run_git_in(&f.path, &["push", "origin", "feature"]);
+            fs::write(f.path.join("sub/.env.local"), "secret").unwrap();
+            Some(source)
+        } else {
+            None
+        };
+        match obstacle {
+            "no remote" => f.repo.run_git(&["remote", "remove", "origin"]),
+            "attic occupied" => {
+                fs::write(f.repo.home_path().join(".wt-attic"), "occupied").unwrap();
+                fs::write(f.path.join("notes"), "work").unwrap();
+            }
+            "locked" => f.repo.run_git(&[
+                "worktree",
+                "lock",
+                "--reason",
+                "owner lock",
+                f.path.to_str().unwrap(),
+            ]),
+            "duplicate checkout" => f.repo.run_git(&[
+                "worktree",
+                "add",
+                "--force",
+                f.repo.home_path().join("duplicate").to_str().unwrap(),
+                "feature",
+            ]),
+            _ => {}
+        }
+        let preview = f.json(&["feature", "--dry-run"], 1);
+        assert_eq!(preview[0]["verdict"], "kept", "{obstacle}");
+        assert!(
+            !f.repo
+                .test_config_path()
+                .with_file_name("clean-terminal-history.json")
+                .exists()
+        );
+        let actual = f.json(&["feature"], 1);
+        assert_eq!(actual[0]["verdict"], "kept", "{obstacle}");
+        assert_eq!(preview[0]["reason"], actual[0]["reason"], "{obstacle}");
+        assert!(f.path.exists() && f.exists_branch());
+    }
+}
+
+#[test]
+fn tests_that_clean_rm_after_does_not_depend_on_the_launch_worktree() {
+    let mut f = Fixture::new();
+    let starter = f.repo.add_worktree("starter");
+    let cwd = f.bin.join("waiter-cwd");
+    let hc = f.bin.join("hc");
+    fs::remove_file(&hc).unwrap();
+    fs::write(
+        &hc,
+        format!(
+            r#"#!/bin/sh
+if [ -n "$WORKTRUNK_CLEAN_WAITER_PID" ]; then
+    pwd > {}
+fi
+printf '%s\n' '{{"terminals":[]}}'
+"#,
+            quote(&cwd)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hc, fs::Permissions::from_mode(0o755)).unwrap();
+    rows(
+        f.command()
+            .current_dir(&starter)
+            .args([
+                "clean", "rm", "feature", "--after", "2s", "--format", "json",
+            ])
+            .output()
+            .unwrap(),
+        0,
+    );
+    f.repo
+        .run_git(&["worktree", "remove", starter.to_str().unwrap()]);
+    wait_for_file_content(&f.log());
+    let waiter_cwd = dunce::canonicalize(fs::read_to_string(cwd).unwrap().trim()).unwrap();
+    assert_eq!(waiter_cwd, f.repo.path());
+    assert!(
+        !f.path.exists() && !f.exists_branch(),
+        "{}",
+        fs::read_to_string(f.log()).unwrap()
+    );
 }

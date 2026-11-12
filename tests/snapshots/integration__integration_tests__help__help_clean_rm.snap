@@ -91,17 +91,17 @@ Usage: [1m[36mwt clean rm[0m [36m[OPTIONS][0m [36m[BRANCH]...[0m
   [1m[36m-y[0m, [1m[36m--yes[0m
           Skip approval prompts
 
-Not implemented yet. The planned command refuses primary and pinned worktrees. A busy worktree is backed up now and marked for removal when nothing runs in it; the calling process counts as busy. To unpin a worktree, run [2mwt clean keep --off[0m for that branch.
+Primary and pinned worktrees are refused. A busy worktree is backed up now and marked for removal when nothing runs in it; the calling process counts as busy. To unpin a worktree, run [2mwt clean keep --off[0m for that branch.
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth old-fix [0m[2m[36m--dry-run[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--after[0m[2m 10m[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--wait[0m[2m 5s[0m
 
-With [2m--after[0m, a detached process waits and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it does nothing.
+With [2m--after[0m, the command returns immediately. A detached process waits outside the worktree, then backs up and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it keeps the worktree and logs the reason. [2m--after[0m and [2m--wait[0m cannot be combined.
 
 With [2m--wait[0m, the command stays in the foreground for up to the given duration until the worktree stops being busy, then backs up and removes it. If it is still busy when the wait ends, normal backup and deferral apply, with exit status 0.
 
-Exit status is 0 when every worktree is removed or deferred, and 1 when any worktree is refused or its backup fails. A deferred worktree goes when nothing runs in it.
+Exit status is 0 when every worktree is removed or deferred, and 1 when any worktree is refused or its backup fails. A deferred worktree is marked for a later [2mwt clean sweep[0m; it is removed once nothing runs in it. There is no continuous cleanup daemon.
 
 ----- stderr -----

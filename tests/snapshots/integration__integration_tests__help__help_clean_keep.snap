@@ -74,7 +74,7 @@ Usage: [1m[36mwt clean keep[0m [36m[OPTIONS][0m [36m[BRANCH][0m
   [1m[36m-y[0m, [1m[36m--yes[0m
           Skip approval prompts
 
-Not implemented yet. The planned pin protects a worktree from both [2mwt clean rm[0m and [2mwt clean sweep[0m, including the 7-day rule. [2m--off[0m removes the pin.
+A pin protects a worktree from both [2mwt clean rm[0m and [2mwt clean sweep[0m, including the 7-day rule. [2m--off[0m removes the pin.
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean keep feature/auth[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean keep feature/auth [0m[2m[36m--off[0m

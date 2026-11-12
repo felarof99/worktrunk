@@ -1,4 +1,4 @@
-//! CLI contracts for the clean command skeleton. Tests use isolated commands
+//! Help and completion contracts for clean commands. Tests use isolated commands
 //! and temporary repositories; no real hc terminal or remote is accessed.
 
 use crate::common::{TestRepo, repo, wt_command};

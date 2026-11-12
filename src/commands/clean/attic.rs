@@ -8,8 +8,11 @@
 //! Empty, uninitialized submodules hold nothing to save. Initialized ones must
 //! be clean, with HEAD pinned by the parent's committed tree or reachable from
 //! a remote-tracking ref, and contain no ignored env files. Nested submodules
-//! follow the same rule. Opaque ignored repositories refuse backup because
-//! their ignored-file listing can hide env files.
+//! follow the same rule. Nested repositories under ignored paths are ignored
+//! content: neither saved nor a reason to refuse removal. Only ignored `.env*`
+//! files Git lists in the worktree itself are saved. Untracked repositories
+//! remain a refusal because a file copy cannot preserve their work faithfully.
+//! Preview and save share the same read-only inventory and destination checks.
 //!
 //! Restore checks every copy destination before applying the combined HEAD
 //! patch. Copies publish without replacing existing files, preserve symlinks,
@@ -41,7 +44,6 @@ fn attic_root() -> anyhow::Result<PathBuf> {
         .join(".wt-attic"))
 }
 
-// TODO(clean): used by pieces E and F.
 /// Save uncommitted files locally, publishing only after every copy succeeds.
 pub fn save(
     repo: &Repository,
@@ -121,19 +123,37 @@ pub fn apply(entry: &AtticEntry, worktree: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-// TODO(clean): used by piece F, never during dry-run.
 /// Delete only recognized entries at least thirty days old, without following links.
 pub fn expire(now: Timestamp) -> anyhow::Result<usize> {
     expire_in(&attic_root()?, now)
 }
 
-fn save_in(
+struct SavePlan {
+    patch: Vec<u8>,
+    untracked: Vec<PathBuf>,
+    env_files: Vec<PathBuf>,
+    parent: PathBuf,
+}
+
+/// Check the same inventory and refusals as save, without creating an entry.
+pub(super) fn check(repo: &Repository, facts: &WorktreeFacts) -> anyhow::Result<()> {
+    prepare_in(&attic_root()?, repo, facts).map(|_| ())
+}
+
+/// Git reports opaque ignored repositories with a trailing slash, even when
+/// their directory name starts with `.env`. Their contents stay ignored.
+pub(super) fn is_ignored_env(path: &Path) -> bool {
+    !path.as_os_str().as_encoded_bytes().ends_with(b"/")
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".env"))
+}
+
+fn prepare_in(
     root: &Path,
     repo: &Repository,
     facts: &WorktreeFacts,
-    backup: &BackupResult,
-    now: Timestamp,
-) -> anyhow::Result<Option<AtticEntry>> {
+) -> anyhow::Result<Option<SavePlan>> {
     ensure_submodules_saved(&facts.path)?;
     let patch = git_bytes(
         repo,
@@ -172,18 +192,7 @@ fn save_in(
     let primary = repo.primary_worktree()?;
     let mut env_files = Vec::new();
     for relative in ignored {
-        // ls-files reports an ignored nested repository as "directory/",
-        // without its files. Filtering that basename would silently lose env
-        // files hidden inside it. Ordinary ignored directories are expanded.
-        ensure!(
-            !relative.as_os_str().as_encoded_bytes().ends_with(b"/"),
-            "Cannot save ignored repository directory @ {}; preserve nested repository work first",
-            format_path_for_display(&facts.path.join(&relative))
-        );
-        if !relative
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".env"))
-        {
+        if !is_ignored_env(&relative) {
             continue;
         }
         let differs = match &primary {
@@ -201,6 +210,64 @@ fn save_in(
     {
         return Ok(None);
     }
+    for relative in untracked.iter().chain(&env_files) {
+        check_parents(&facts.path, relative, false)?;
+        let source = facts.path.join(relative);
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(
+            metadata.is_file() || metadata.is_symlink(),
+            "Cannot save non-file @ {}; preserve nested repository work first",
+            format_path_for_display(&source)
+        );
+        if metadata.is_file() {
+            fs::File::open(&source).context("Cannot read file for attic backup")?;
+        } else {
+            fs::read_link(&source)?;
+        }
+    }
+    let branch = branch_name(facts.branch.as_deref(), &facts.path)?;
+    let parent = branch_directory(root, repo, &branch)?;
+    for path in [
+        root,
+        parent
+            .parent()
+            .context("Missing attic repository directory")?,
+        &parent,
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "Refusing non-directory or symlink @ {}",
+                format_path_for_display(path)
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to inspect attic destination"),
+        }
+    }
+    Ok(Some(SavePlan {
+        patch,
+        untracked,
+        env_files,
+        parent,
+    }))
+}
+
+fn save_in(
+    root: &Path,
+    repo: &Repository,
+    facts: &WorktreeFacts,
+    backup: &BackupResult,
+    now: Timestamp,
+) -> anyhow::Result<Option<AtticEntry>> {
+    let Some(SavePlan {
+        patch,
+        untracked,
+        env_files,
+        parent,
+    }) = prepare_in(root, repo, facts)?
+    else {
+        return Ok(None);
+    };
     let metadata = AtticMetadata {
         repo: repo.repo_path()?.to_path_buf(),
         branch: facts.branch.clone(),
@@ -215,8 +282,6 @@ fn save_in(
             }
         },
     };
-    let branch = entry_branch(&metadata)?;
-    let parent = branch_directory(root, repo, &branch)?;
     ensure_directory(root)?;
     ensure_directory(
         parent
@@ -362,12 +427,15 @@ fn expire_in(root: &Path, now: Timestamp) -> anyhow::Result<usize> {
 }
 
 fn entry_branch(metadata: &AtticMetadata) -> anyhow::Result<String> {
-    match &metadata.branch {
-        Some(branch) => Ok(branch.clone()),
+    branch_name(metadata.branch.as_deref(), &metadata.worktree_path)
+}
+
+fn branch_name(branch: Option<&str>, worktree: &Path) -> anyhow::Result<String> {
+    match branch {
+        Some(branch) => Ok(branch.into()),
         None => Ok(format!(
             "detached-{}",
-            metadata
-                .worktree_path
+            worktree
                 .file_name()
                 .context("Missing detached worktree name")?
                 .to_string_lossy()
@@ -390,7 +458,10 @@ fn branch_directory(root: &Path, repo: &Repository, branch: &str) -> anyhow::Res
 }
 
 fn git_bytes(repo: &Repository, worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-    let output = repo.worktree_at(worktree).run_command_output(args)?;
+    let read_args: Vec<_> = std::iter::once("--no-optional-locks")
+        .chain(args.iter().copied())
+        .collect();
+    let output = repo.worktree_at(worktree).run_command_output(&read_args)?;
     if !output.status.success() {
         return Err(CommandError::from_failed_output("git", args, &output).into());
     }
@@ -510,14 +581,7 @@ fn ensure_submodules_saved(worktree: &Path) -> anyhow::Result<()> {
         {
             let path = git_path(bytes)?;
             ensure!(
-                !bytes.ends_with(b"/"),
-                "Cannot save submodule @ {display}: ignored repository directory @ {} may contain unsaved env files",
-                format_path_for_display(&path)
-            );
-            ensure!(
-                !path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(".env")),
+                !is_ignored_env(&path),
                 "Cannot save submodule @ {display}: ignored env file @ {}",
                 format_path_for_display(&path)
             );
@@ -534,6 +598,7 @@ fn submodule_git_bytes(worktree: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>
         .args(args.iter().copied())
         .current_dir(worktree)
         .scrub_git_discovery_env()
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .run()
         .with_context(|| {
             format!(
@@ -1325,13 +1390,13 @@ mod tests {
     }
 
     #[test]
-    fn tests_that_ignored_nested_repositories_cannot_hide_env_files_from_backup() {
+    fn tests_that_ignored_fixture_repositories_are_not_saved() {
         let mut repo = TestRepo::with_initial_commit();
-        fs::write(repo.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
         repo.run_git(&["add", ".gitignore"]);
         repo.run_git(&["commit", "-m", "ignore nested repo"]);
         let path = repo.add_worktree("feature/auth");
-        let nested = path.join("ignored");
+        let nested = path.join("target/debug/wt-test-fixtures/x/repo");
         repo.run_git(&["init", "-b", "main", nested.to_str().unwrap()]);
         repo.run_git_in(&nested, &["commit", "--allow-empty", "-m", "nested base"]);
         fs::write(nested.join(".env.local"), "local secret").unwrap();
@@ -1351,7 +1416,7 @@ mod tests {
                 ]
             )
             .unwrap(),
-            vec![PathBuf::from("ignored/")]
+            vec![PathBuf::from("target/debug/wt-test-fixtures/x/repo/")]
         );
         let result = save_in(
             &root(&repo),
@@ -1360,10 +1425,7 @@ mod tests {
             &BackupResult::OnRemote,
             now(),
         );
-        assert!(
-            result.is_err(),
-            "Ignored nested env data must prevent removal"
-        );
+        assert!(result.unwrap().is_none());
         assert!(!root(&repo).exists());
         assert_eq!(
             fs::read(nested.join(".env.local")).unwrap(),

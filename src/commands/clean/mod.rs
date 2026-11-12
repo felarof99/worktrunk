@@ -1,6 +1,5 @@
-//! Back up worktrees before cleaning them up. This is the shared contract for
-//! pieces A–F; the skeleton implements only CLI dispatch and error stubs. No
-//! stub reads hc, writes state, pushes, backs up, or removes anything.
+//! Back up worktrees before cleaning them up. Shared observations and pure
+//! policy feed the same backup and removal checks for explicit rm and sweep.
 //!
 //! # Addressing and observations
 //!
@@ -72,7 +71,11 @@
 //!    `tracked.patch` from `git diff --binary HEAD`, `untracked/` preserving
 //!    relative paths, `ignored-env/` for those env files, and `meta.json`
 //!    containing repo, branch, tip sha, original path, time, and backup ref.
-//!    Nothing in the attic is uploaded.
+//!    Nothing in the attic is uploaded. Nested repositories under ignored
+//!    paths are ignored content: they are not saved and do not block removal.
+//!    Only ignored `.env*` files Git lists in the worktree itself are saved;
+//!    untracked repositories still refuse backup because file copies cannot
+//!    preserve their work faithfully.
 //! 4. Immediately before deletion, compare the tip sha AND the exact
 //!    `git status --porcelain` output against the backed-up snapshot. If either
 //!    changed, stop with "changed during backup". Any failure in steps 1–4
@@ -95,7 +98,10 @@
 //! that are still exiting after a space closes. `--dry-run` prints every verdict
 //! and reason without any changes (including marks, registry/history writes,
 //! terminal termination, delayed jobs, or attic expiry). It may `ls-remote`
-//! but never pushes. Network detail must not gate the first terminal output.
+//! but never pushes. Preview shares the content snapshot, attic inventory and
+//! refusals, submodule checks, lock gate, and final read-only removal checks.
+//! It reports `on-remote` for an already-backed-up tip; otherwise backup is null
+//! and the reason names the ref that would be pushed. Network detail must not gate the first terminal output.
 //!
 //! # hc, registry, attic, and restore
 //!
@@ -126,8 +132,8 @@
 //!
 //! | File | Owner | Responsibility |
 //! |---|---|---|
-//! | `src/cli/clean.rs` | skeleton | clap surface and help |
-//! | `src/commands/clean/mod.rs` | skeleton | this contract, shared types, dispatch |
+//! | `src/cli/clean.rs` | shared | clap surface and help |
+//! | `src/commands/clean/mod.rs` | shared | this contract, shared types, dispatch |
 //! | `facts.rs` | A | last touch, dirty status, lock, tip, worktree facts |
 //! | `terminals.rs` | A | processes, hc terminals, turn history |
 //! | `remote.rs` | B | remote snapshot, tip presence, push and confirmation |
@@ -165,7 +171,6 @@ use crate::cli::CleanCommand;
 /// An absolute time, preserving filesystem precision and supplied by callers.
 pub type Timestamp = std::time::SystemTime;
 
-// TODO(clean): used by pieces A, D, E, and F.
 /// Observed facts for one worktree, including the exact backup recheck inputs.
 #[derive(Debug, Clone)]
 pub struct WorktreeFacts {
@@ -185,7 +190,6 @@ pub struct WorktreeFacts {
     pub status_porcelain: Vec<u8>,
 }
 
-// TODO(clean): used by pieces A, D, E, and F.
 /// Processes and live terminals inside a worktree; unknown activity means busy.
 #[derive(Debug, Clone)]
 pub struct BusyState {
@@ -194,7 +198,6 @@ pub struct BusyState {
     pub unknown: bool,
 }
 
-// TODO(clean): used by piece A.
 /// One process's identity and observed working directory.
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
@@ -202,7 +205,6 @@ pub struct ProcessInfo {
     pub cwd: PathBuf,
 }
 
-// TODO(clean): used by pieces A, D, E, and F.
 /// One live hc terminal; cwd is its launch directory, not a later shell cwd.
 #[derive(Debug, Clone)]
 pub struct HcTerminal {
@@ -214,7 +216,6 @@ pub struct HcTerminal {
     pub turn_changed_at: Option<Timestamp>,
 }
 
-// TODO(clean): used by pieces A and D.
 /// Status values in the hc protocol; missing status stays None on the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -226,7 +227,6 @@ pub enum TerminalStatus {
     Error,
 }
 
-// TODO(clean): used by piece A.
 /// A run's process and terminal observations before filtering by worktree path.
 #[derive(Debug, Clone)]
 pub struct ActivitySnapshot {
@@ -235,7 +235,6 @@ pub struct ActivitySnapshot {
     pub unknown: bool,
 }
 
-// TODO(clean): used by pieces D, E, and F.
 /// A policy decision; Remove still requires backup and the final safety checks.
 #[derive(Debug, Clone)]
 pub enum Verdict {
@@ -244,7 +243,6 @@ pub enum Verdict {
     Defer,
 }
 
-// TODO(clean): used by pieces D, E, and F.
 /// Reasons a worktree is kept; rm treats these as refusals rather than success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeepReason {
@@ -256,7 +254,6 @@ pub enum KeepReason {
     BackupFailed(String),
 }
 
-// TODO(clean): used by pieces B, C, E, and F.
 /// Outcome of confirming the tip on a remote, independent of the local attic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupResult {
@@ -265,7 +262,6 @@ pub enum BackupResult {
     Failed { reason: String },
 }
 
-// TODO(clean): used by pieces B, E, and F.
 /// One remote advertisement, keyed by full ref name; values are object IDs.
 #[derive(Debug, Clone)]
 pub struct RemoteSnapshot {
@@ -275,7 +271,6 @@ pub struct RemoteSnapshot {
     pub default_branch_ref: Option<String>,
 }
 
-// TODO(clean): used by pieces C, E, and F.
 /// An attic entry's directory and metadata; its files never leave this machine.
 #[derive(Debug, Clone)]
 pub struct AtticEntry {
@@ -283,7 +278,6 @@ pub struct AtticEntry {
     pub metadata: AtticMetadata,
 }
 
-// TODO(clean): used by piece C.
 /// Metadata stored with tracked.patch, untracked/, and ignored-env/ in the attic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtticMetadata {
@@ -295,7 +289,6 @@ pub struct AtticMetadata {
     pub backup_ref: Option<String>,
 }
 
-// TODO(clean): used by pieces A and D.
 /// Persistent cleanup marks loaded for a worktree.
 #[derive(Debug, Clone, Copy)]
 pub struct KeepState {
@@ -303,7 +296,6 @@ pub struct KeepState {
     pub remove_requested: bool,
 }
 
-// TODO(clean): used by pieces E and F.
 /// Shared removal controls; yes governs hook approval, never backup safety.
 #[derive(Debug, Clone, Copy)]
 pub struct RemovalOptions {
@@ -311,7 +303,6 @@ pub struct RemovalOptions {
     pub yes: bool,
 }
 
-// TODO(clean): used by pieces E and F.
 /// One item in the clean JSON array; optional fields serialize as explicit null.
 #[derive(Debug, Clone, Serialize)]
 pub struct CleanRow {
@@ -325,7 +316,6 @@ pub struct CleanRow {
     pub attic: Option<PathBuf>,
 }
 
-// TODO(clean): used by pieces E and F.
 /// The four stable verdict strings in clean JSON output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

@@ -83,14 +83,25 @@ Usage: [1m[36mwt clean sweep[0m [36m[OPTIONS][0m
   [1m[36m-y[0m, [1m[36m--yes[0m
           Skip approval prompts
 
-Not implemented yet. The planned sweep keeps primary and pinned worktrees. A worktree silent for at least 7 days is removed after ending its non-working hc terminals. Otherwise, busy worktrees are kept, remove-requested worktrees are removed, and untouched worktrees are removed after 24 hours.
+The sweep checks linked worktrees in order; the first matching rule wins. Every removal still requires a successful backup and the lock and content checks.
 
-Busy means a live process has its working directory inside the worktree, or a live hc terminal was launched inside it. Last touch is the newest timestamp of the worktree's index, HEAD, logs/HEAD, and changed or untracked files. Silent means last touch is at least 7 days old and every hc terminal is not working and has not advanced its turn in 7 days. A newly observed terminal has no such history yet.
+                Condition                                    Result                     
+ ─────────────────────────────────────── ────────────────────────────────────────────── 
+ Primary worktree or bare repository     Keep                                           
+ Pinned                                  Keep                                           
+ Silent for at least 7 days              Remove; first end its non-working hc terminals 
+ Busy                                    Keep                                           
+ Earlier busy [2mclean rm[0m requested removal Remove                                         
+ Touched less than 24 hours ago          Keep                                           
+ Otherwise                               Remove                                         
+
+Busy means a live process has its working directory inside the worktree, or a live hc terminal was launched inside it. Last touch is the newest timestamp of the worktree's index, HEAD, logs/HEAD, and changed or untracked files. Silent means last touch is at least 7 days old and every hc terminal is not working and has not advanced its turn in 7 days. A newly observed terminal has no such history yet. Missing [2mhc[0m means no terminals; failed process or terminal inspection keeps the worktree. PR 
+merge status does not affect these rules.
 
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--dry-run[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean sweep [0m[2m[36m--all-repos[0m[2m [0m[2m[36m--root[0m[2m ~/code [0m[2m[36m--root[0m[2m ~/work[0m
 
-[2m--all-repos[0m covers the registry of repos where any [2mwt clean[0m command has run, plus repos owning linked worktrees found up to two folders below each [2m--root[0m. Repos with unreachable primary worktrees are skipped and reported. Attic entries older than 30 days are deleted, except during a dry run.
+[2m--all-repos[0m covers the registry of repos where any [2mwt clean[0m command has run, plus repos owning linked worktrees found up to two folders below each [2m--root[0m. Repos with unreachable primary worktrees are skipped and reported. Attic entries at least 30 days old are deleted, except during a dry run.
 
 Kept worktrees are normal results. Exit status is 0 unless the sweep itself fails.
 

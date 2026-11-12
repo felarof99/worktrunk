@@ -8,7 +8,8 @@
 //! saved patch/files (including primary env copies omitted from the attic).
 //! File stamps bracket hashing and the slow activity probe: same-status edits
 //! during either interval keep the worktree, even if its bytes are restored.
-//! Directory stamps include empty and ignored directories, where a new env
+//! Directory stamps include empty and ignored directories (excluding opaque
+//! ignored repositories), where a new env
 //! file would change neither porcelain nor an ancestor directory's timestamp.
 //! Synchronous Repository::remove_worktree (the existing Git removal fallback)
 //! retains Git's lock/submodule/error checks at the original path, without the
@@ -18,7 +19,7 @@
 //! outside the requested worktree. Their private stdin protocol records the
 //! original branch, tip, status and precise last-touch time. The shell binds
 //! the protocol marker to its PID before exec: nested wt invocations cannot
-//! inherit waiter mode. Background hooks use read-only approvals unless -y
+//! inherit waiter mode. Requests carry no launch-directory dependency. Background hooks use read-only approvals unless -y
 //! was supplied. Every actual deletion still goes through remove_one.
 
 use std::collections::BTreeMap;
@@ -76,15 +77,18 @@ pub(crate) fn run(
     format: SwitchFormat,
     yes: bool,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        after.is_none() || wait.is_none(),
-        "--after and --wait cannot be used together"
-    );
     if is_waiter() {
         return run_waiter();
     }
     // Also precedes default-branch discovery in bare repositories.
-    eprintln!("{}", progress_message("Checking worktrees..."));
+    eprintln!(
+        "{}",
+        progress_message(if dry_run {
+            "Checking worktrees (--dry-run)..."
+        } else {
+            "Checking worktrees..."
+        })
+    );
     let repo = Repository::current()?;
     let branches = if branches.is_empty() {
         vec!["@".into()]
@@ -119,16 +123,10 @@ pub(crate) fn run(
             let mut verdict = policy::rm(&facts, now)?;
             if let Verdict::Keep(reason) = &verdict {
                 row.reason = keep_reason(reason);
-            } else if let Some(after) = after {
-                if dry_run {
-                    row.verdict = OutputVerdict::WouldRemove;
-                    row.reason =
-                        format!("would schedule after {}", humantime::format_duration(after));
-                } else {
-                    schedule(&repo, &facts, after, options, now)?;
-                    row.verdict = OutputVerdict::Deferred;
-                    row.reason = format!("scheduled after {}", humantime::format_duration(after));
-                }
+            } else if let Some(after) = after.filter(|_| !dry_run) {
+                schedule(&repo, &facts, after, options, now)?;
+                row.verdict = OutputVerdict::Deferred;
+                row.reason = format!("scheduled after {}", humantime::format_duration(after));
             } else {
                 if let Some(wait) = wait
                     && !dry_run
@@ -137,7 +135,7 @@ pub(crate) fn run(
                     facts = wait_until_idle(&repo, &path, wait)?;
                     verdict = policy::rm(&facts, now)?;
                 }
-                if let Some(preview) = preview_or_keep(&repo, &facts, &verdict, dry_run)? {
+                if let Some(preview) = keep_row(&repo, &facts, &verdict)? {
                     row = preview;
                 } else {
                     if snapshot.is_none() {
@@ -149,7 +147,16 @@ pub(crate) fn run(
                     }
                     match snapshot.as_ref().context("Missing remote snapshot")? {
                         Ok(snapshot) => {
-                            row = remove_one(&repo, &facts, snapshot, &verdict, options, now)?
+                            row = remove_one(&repo, &facts, snapshot, &verdict, options, now)?;
+                            if dry_run
+                                && let Some(after) = after
+                                && row.verdict != OutputVerdict::Kept
+                            {
+                                row.reason.push_str(&format!(
+                                    "; would schedule after {}",
+                                    humantime::format_duration(after)
+                                ));
+                            }
                         }
                         Err(reason) => row.reason = format!("backup failed ({reason})"),
                     }
@@ -202,11 +209,10 @@ fn factory_lock(reason: &str) -> bool {
     reason.starts_with("hc factory run") || reason.starts_with("herdr-factory run")
 }
 
-fn preview_or_keep(
+fn keep_row(
     repo: &Repository,
     facts: &WorktreeFacts,
     verdict: &Verdict,
-    dry_run: bool,
 ) -> anyhow::Result<Option<CleanRow>> {
     let mut row = row_for(repo, &facts.path, facts.branch.clone())?;
     if let Verdict::Keep(reason) = verdict {
@@ -219,12 +225,6 @@ fn preview_or_keep(
         .is_some_and(|reason| !factory_lock(reason))
     {
         row.reason = "locked".into();
-    } else if dry_run {
-        (row.verdict, row.reason) = match verdict {
-            Verdict::Defer => (OutputVerdict::Deferred, DEFERRED.into()),
-            Verdict::Remove { .. } => (OutputVerdict::WouldRemove, "backup before removal".into()),
-            Verdict::Keep(_) => unreachable!(),
-        };
     } else {
         return Ok(None);
     }
@@ -275,17 +275,55 @@ pub fn remove_one(
     options: RemovalOptions,
     now: Timestamp,
 ) -> anyhow::Result<CleanRow> {
-    if let Some(row) = preview_or_keep(repo, facts, verdict, options.dry_run)? {
+    if let Some(row) = keep_row(repo, facts, verdict)? {
         return Ok(row);
     }
     let mut row = row_for(repo, &facts.path, facts.branch.clone())?;
-    let content = match content_snapshot(facts, ContentSource::Worktree) {
+    let content = match (|| {
+        attic::check(repo, facts)?;
+        if matches!(verdict, Verdict::Remove { .. }) {
+            check_branch_checkout(repo, facts)?;
+        }
+        content_snapshot(facts, ContentSource::Worktree)
+    })() {
         Ok(content) => content,
         Err(error) => {
             row.reason = format!("backup failed ({})", error_reason(error)?);
             return Ok(row);
         }
     };
+    if options.dry_run {
+        let result = (|| {
+            let on_remote = remote::tip_on_remote(repo, facts, snapshot)?;
+            let reason = if on_remote {
+                row.backup = Some("on-remote".into());
+                "on remote".into()
+            } else {
+                format!("would push {}", remote::backup_reference(repo, facts)?)
+            };
+            if matches!(verdict, Verdict::Remove { .. })
+                && final_check(repo, facts, now, true, &mut row)?.is_none()
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(content.unchanged(), "changed during backup");
+            row.verdict = if matches!(verdict, Verdict::Defer) {
+                OutputVerdict::Deferred
+            } else {
+                OutputVerdict::WouldRemove
+            };
+            row.reason = if matches!(verdict, Verdict::Defer) {
+                format!("{DEFERRED}; {reason}")
+            } else {
+                reason
+            };
+            Ok::<_, anyhow::Error>(())
+        })();
+        if let Err(error) = result {
+            row.reason = format!("backup failed ({})", error_reason(error)?);
+        }
+        return Ok(row);
+    }
     let backup = match remote::backup(repo, facts, snapshot) {
         Ok(BackupResult::Failed { reason }) => {
             row.reason = format!("backup failed ({reason})");
@@ -301,7 +339,10 @@ pub fn remove_one(
         BackupResult::OnRemote => {
             eprintln!(
                 "{}",
-                info_message(cformat!("On <bold>{}</>", snapshot.remote))
+                info_message(cformat!(
+                    "Commits backed up on <bold>{}</>",
+                    snapshot.remote
+                ))
             );
             "on-remote".into()
         }
@@ -462,6 +503,21 @@ fn content_snapshot(
         std::str::from_utf8(&head)?.trim() == facts.tip_sha && status == facts.status_porcelain,
         "changed during backup"
     );
+    let ignored_paths = git_bytes(
+        &facts.path,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let ignored_repositories: Vec<_> = ignored_paths
+        .split(|byte| *byte == 0)
+        .filter(|name| name.ends_with(b"/"))
+        .map(|name| git_path(name).map(|path| facts.path.join(path)))
+        .collect::<anyhow::Result<_>>()?;
     let mut hash = Sha256::new();
     let patch = match source {
         ContentSource::Worktree => {
@@ -471,7 +527,11 @@ fn content_snapshot(
             for entry in ignore::WalkBuilder::new(&facts.path)
                 .standard_filters(false)
                 .follow_links(false)
-                .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+                .filter_entry(move |entry| {
+                    entry.depth() == 0
+                        || (entry.file_name() != ".git"
+                            && !ignored_repositories.iter().any(|path| path == entry.path()))
+                })
                 .build()
             {
                 let entry = entry.context("Failed to inspect worktree directories")?;
@@ -516,11 +576,14 @@ fn content_snapshot(
     hash.update((patch.len() as u64).to_le_bytes());
     hash.update(patch);
     for ignored in [false, true] {
-        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
-        if ignored {
-            args.push("--ignored");
-        }
-        let paths = git_bytes(&facts.path, &args)?;
+        let paths = if ignored {
+            ignored_paths.clone()
+        } else {
+            git_bytes(
+                &facts.path,
+                &["ls-files", "--others", "--exclude-standard", "-z"],
+            )?
+        };
         for name in paths
             .split(|byte| *byte == 0)
             .filter(|name| !name.is_empty())
@@ -534,11 +597,7 @@ fn content_snapshot(
                 live.parent().context("Missing backup file parent")?,
                 &facts.path,
             )?;
-            if ignored
-                && !path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(".env"))
-            {
+            if ignored && !attic::is_ignored_env(path) {
                 continue;
             }
             hash.update((name.len() as u64).to_le_bytes());
@@ -618,6 +677,84 @@ fn approve_hooks(
     }
 }
 
+/// Recheck identity, activity, marks, locks and branch checkout immediately
+/// before removal. Preview permits only the unchanged silent terminals that
+/// the real sweep would end; it never ends them itself.
+fn final_check(
+    repo: &Repository,
+    facts: &WorktreeFacts,
+    now: Timestamp,
+    preview: bool,
+    row: &mut CleanRow,
+) -> anyhow::Result<Option<WorktreeFacts>> {
+    let fresh = observe(repo, &facts.path)?;
+    if fresh.tip_sha != facts.tip_sha
+        || fresh.status_porcelain != facts.status_porcelain
+        || fresh.branch != facts.branch
+        || (is_waiter() && fresh.last_touch > facts.last_touch)
+    {
+        row.reason = "changed during backup".into();
+        return Ok(None);
+    }
+    if fresh.primary || fresh.pinned {
+        row.reason = if fresh.primary { "primary" } else { "pinned" }.into();
+        return Ok(None);
+    }
+    if fresh
+        .lock_reason
+        .as_deref()
+        .is_some_and(|reason| !factory_lock(reason))
+    {
+        row.reason = "locked".into();
+        return Ok(None);
+    }
+    // The policy type carries terminals to end, but no reason discriminant.
+    // Only a seven-day sweep can remove an initially busy worktree. Even then
+    // new processes and terminals left alive by end() keep the worktree.
+    let silent = now
+        .duration_since(facts.last_touch)
+        .is_ok_and(|age| age >= Duration::from_secs(7 * 24 * 60 * 60))
+        && matches!(policy::sweep(facts, now)?, Verdict::Remove { .. });
+    let new_process = fresh.busy.processes.iter().any(|process| {
+        !silent
+            || !facts
+                .busy
+                .processes
+                .iter()
+                .any(|old| old.pid == process.pid)
+    });
+    let live_terminal = fresh.busy.terminals.iter().any(|terminal| {
+        !preview
+            || !silent
+            || terminal.status == Some(super::TerminalStatus::Working)
+            || !facts.busy.terminals.iter().any(|old| {
+                old.address == terminal.address
+                    && old.cwd == terminal.cwd
+                    && old.turn == terminal.turn
+            })
+    });
+    if fresh.busy.unknown || live_terminal || new_process {
+        row.reason = "in use".into();
+        return Ok(None);
+    }
+    check_branch_checkout(repo, facts)?;
+    Ok(Some(fresh))
+}
+
+fn check_branch_checkout(repo: &Repository, facts: &WorktreeFacts) -> anyhow::Result<()> {
+    let repo = Repository::at(repo.repo_path()?)?;
+    if let Some(branch) = &facts.branch {
+        anyhow::ensure!(
+            !repo
+                .list_worktrees()?
+                .iter()
+                .any(|w| w.path != facts.path && w.branch.as_ref() == Some(branch)),
+            "Local branch is checked out in another worktree"
+        );
+    }
+    Ok(())
+}
+
 fn delete_backed_up(
     repo: &Repository,
     facts: &WorktreeFacts,
@@ -665,57 +802,13 @@ fn delete_backed_up(
             primary: &primary,
         },
     )?;
-    let fresh = observe(&stable, &facts.path)?;
-    if fresh.tip_sha != facts.tip_sha
-        || fresh.status_porcelain != facts.status_porcelain
-        || fresh.branch != facts.branch
-        || live.hash != *content
-        || saved.hash != *content
-        || (is_waiter() && fresh.last_touch > facts.last_touch)
-    {
+    if live.hash != *content || saved.hash != *content {
         row.reason = "changed during backup".into();
         return Ok(());
     }
-    if fresh.primary || fresh.pinned {
-        row.reason = if fresh.primary { "primary" } else { "pinned" }.into();
+    let Some(fresh) = final_check(&stable, facts, now, false, row)? else {
         return Ok(());
-    }
-    if fresh
-        .lock_reason
-        .as_deref()
-        .is_some_and(|reason| !factory_lock(reason))
-    {
-        row.reason = "locked".into();
-        return Ok(());
-    }
-    // The policy type carries terminals to end, but no reason discriminant.
-    // Only a seven-day sweep can remove an initially busy worktree. Even then
-    // new processes and terminals left alive by end() keep the worktree.
-    let silent = now
-        .duration_since(facts.last_touch)
-        .is_ok_and(|age| age >= Duration::from_secs(7 * 24 * 60 * 60))
-        && matches!(policy::sweep(facts, now)?, Verdict::Remove { .. });
-    let new_process = fresh.busy.processes.iter().any(|process| {
-        !silent
-            || !facts
-                .busy
-                .processes
-                .iter()
-                .any(|old| old.pid == process.pid)
-    });
-    if fresh.busy.unknown || !fresh.busy.terminals.is_empty() || new_process {
-        row.reason = "in use".into();
-        return Ok(());
-    }
-    if let Some(branch) = &facts.branch {
-        anyhow::ensure!(
-            !stable
-                .list_worktrees()?
-                .iter()
-                .any(|w| w.path != facts.path && w.branch.as_ref() == Some(branch)),
-            "Local branch is checked out in another worktree"
-        );
-    }
+    };
     // An unwritable log must fail before deletion.
     let mut log = open_log(&stable)?;
     stable
@@ -760,8 +853,6 @@ fn delete_backed_up(
                 "worktree removed; local branch kept ({})",
                 error_reason(error)?
             );
-            write_log(&mut log, row)?;
-            return Ok(());
         }
     }
     keep::set_remove_requested(&stable, &facts.path, false)?;
@@ -791,7 +882,7 @@ fn error_reason(error: anyhow::Error) -> anyhow::Result<String> {
     Ok(error.to_string())
 }
 
-fn print_row(row: &CleanRow, dry_run: bool) {
+pub(super) fn print_row(row: &CleanRow, dry_run: bool) {
     let path = format_path_for_display(&row.path);
     let message = match row.verdict {
         OutputVerdict::Removed => success_message(format!("Removed worktree @ {path}")),
@@ -854,7 +945,6 @@ struct DelayedRequest {
     tip_sha: String,
     status: Vec<u8>,
     last_touch: Timestamp,
-    source: PathBuf,
     after: Duration,
     yes: bool,
 }
@@ -881,7 +971,6 @@ pub fn schedule(
         tip_sha: facts.tip_sha.clone(),
         status: facts.status_porcelain.clone(),
         last_touch: facts.last_touch,
-        source: repo.discovery_path().to_path_buf(),
         after,
         yes: options.yes,
     };
@@ -944,9 +1033,8 @@ fn run_waiter() -> anyhow::Result<()> {
                 Verdict::Remove { .. } => {
                     eprintln!("{}", progress_message("Checking remote backup..."));
                     let snapshot = remote::fetch_snapshot(&repo)?;
-                    let source = Repository::at(&request.source)?;
                     row = remove_one(
-                        &source,
+                        &repo,
                         &facts,
                         &snapshot,
                         &verdict,

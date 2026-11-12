@@ -1,5 +1,5 @@
-//! Sweep CLI wiring uses isolated state and fake activity commands. Removal is
-//! tested with a fake beside sweep.rs until piece E supplies the shared remover.
+//! Sweep CLI wiring and real removal use temporary repos, local bare remotes,
+//! isolated user state, and fake activity commands.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -291,14 +291,10 @@ fn tests_that_clean_sweep_text_groups_rows_and_closes_with_counts() {
     let _settings = setup_snapshot_settings(&fixture).bind_to_scope();
     let output = command(&fixture).arg("--dry-run").output().unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r"
-REPOSITORY @ _REPO_
-○ kept recent @ _REPO_.recent (recent)
-");
-    assert_snapshot!(String::from_utf8_lossy(&output.stderr), @r"
-◎ Inspecting worktrees (--dry-run)...
-○ would-remove 0, kept 1 (1 recent)
-");
+    assert_snapshot!(String::from_utf8_lossy(&output.stdout), @r"REPOSITORY @ _REPO_
+▲ Kept worktree @ _REPO_.recent: recent");
+    assert_snapshot!(String::from_utf8_lossy(&output.stderr), @r"◎ Checking worktrees (--dry-run)...
+○ Would remove 0, kept 1 (1 recent)");
 }
 
 #[test]
@@ -467,4 +463,125 @@ kill -{signal} $$
     for file in ["clean-repositories.json", "clean-terminal-history.json"] {
         assert!(!fixture.test_config_path().with_file_name(file).exists());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn tests_that_clean_sweep_real_remover_matches_preview_and_preserves_busy_worktrees() {
+    let mut fixture = TestRepo::standard_main_only();
+    let pushed = fixture.add_worktree("pushed");
+    let unpushed = fixture.add_worktree("unpushed");
+    let busy = fixture.add_worktree("busy");
+    fixture.commit_in_worktree(&unpushed, "unique", "unpublished", "unpublished");
+    let tip = fixture.head_sha_in(&unpushed);
+    let old = UNIX_EPOCH + Duration::from_secs(TEST_EPOCH - 2 * 86_400);
+    for path in [&pushed, &unpushed, &busy] {
+        let admin = fixture.repo.worktree_at(path).git_dir().unwrap();
+        for file in ["HEAD", "index", "logs/HEAD"] {
+            fs::File::options()
+                .write(true)
+                .open(admin.join(file))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+    }
+    let mut preview = command(&fixture);
+    let bin = fixture.home_path().join("sweep-bin");
+    let activity = format!(
+        "p1\nR0\ncinit\nfcwd\nn/\np2\nR1\ncbusy\nfcwd\nn{}\n",
+        busy.display()
+    );
+    MockConfig::new("lsof")
+        .command("_default", MockResponse::output(&activity))
+        .write(&bin);
+    let watched = [
+        fixture.path().into(),
+        pushed.clone(),
+        unpushed.clone(),
+        busy.clone(),
+        fixture.remote_path().unwrap().into(),
+        fixture
+            .test_config_path()
+            .with_file_name("clean-repositories.json"),
+        fixture
+            .test_config_path()
+            .with_file_name("clean-terminal-history.json"),
+        fixture.home_path().join(".wt-attic"),
+    ];
+    let before: Vec<_> = watched.iter().map(|path| contents(path)).collect();
+    let output = preview
+        .args(["--dry-run", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let preview: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        before,
+        watched
+            .iter()
+            .map(|path| contents(path))
+            .collect::<Vec<_>>()
+    );
+    let row = |name: &str| preview.iter().find(|row| row["branch"] == name).unwrap();
+    assert_eq!(row("pushed")["verdict"], "would-remove");
+    assert_eq!(row("pushed")["backup"], "on-remote");
+    assert_eq!(row("unpushed")["verdict"], "would-remove");
+    assert!(row("unpushed")["backup"].is_null());
+    assert!(
+        row("unpushed")["reason"]
+            .as_str()
+            .unwrap()
+            .contains("refs/heads/wt-backup/unpushed")
+    );
+    assert_eq!(row("busy")["verdict"], "kept");
+    assert_eq!(row("busy")["reason"], "in use");
+    let mut actual = command(&fixture);
+    MockConfig::new("lsof")
+        .command("_default", MockResponse::output(&activity))
+        .write(&bin);
+    let output = actual.args(["--format", "json"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let actual: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual.len(), preview.len());
+    for row in &actual {
+        let expected = preview
+            .iter()
+            .find(|before| before["branch"] == row["branch"])
+            .unwrap();
+        assert_eq!(
+            row["verdict"],
+            if expected["verdict"] == "would-remove" {
+                "removed"
+            } else {
+                "kept"
+            }
+        );
+    }
+    assert!(!pushed.exists() && !unpushed.exists());
+    assert!(busy.join("file.txt").exists());
+    let fresh = worktrunk::git::Repository::at(fixture.path()).unwrap();
+    assert!(
+        !fresh
+            .run_command_check(&["show-ref", "--verify", "--quiet", "refs/heads/pushed"])
+            .unwrap()
+    );
+    assert!(
+        !fresh
+            .run_command_check(&["show-ref", "--verify", "--quiet", "refs/heads/unpushed"])
+            .unwrap()
+    );
+    assert!(
+        fresh
+            .run_command_check(&["show-ref", "--verify", "--quiet", "refs/heads/busy"])
+            .unwrap()
+    );
+    let backup = fixture
+        .git_command()
+        .current_dir(fixture.remote_path().unwrap())
+        .args(["rev-parse", "refs/heads/wt-backup/unpushed"])
+        .run()
+        .unwrap();
+    assert!(backup.status.success());
+    assert_eq!(String::from_utf8(backup.stdout).unwrap().trim(), tip);
 }

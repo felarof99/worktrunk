@@ -14,7 +14,6 @@ fn busy(activity: &BusyState) -> bool {
     activity.unknown || !activity.processes.is_empty() || !activity.terminals.is_empty()
 }
 
-// TODO(clean): used by piece F.
 /// Apply the sweep table in order: primary/bare, pinned, silent seven days,
 /// busy, remove-requested, recent, otherwise remove. Only the silent rule may
 /// nominate terminals to end; locks and backup gates still protect removal.
@@ -50,7 +49,6 @@ pub fn sweep(facts: &WorktreeFacts, now: Timestamp) -> anyhow::Result<Verdict> {
     Ok(Verdict::Remove { terminals: vec![] })
 }
 
-// TODO(clean): used by piece E.
 /// Apply the explicit-rm table: refuse primary and pinned worktrees, defer
 /// busy worktrees after backup, otherwise remove. The caller's process counts
 /// as busy; refusal reasons become rm failures. This function never backs up.
