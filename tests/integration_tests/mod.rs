@@ -16,6 +16,7 @@ pub mod clean_attic;
 pub mod clean_facts;
 pub mod clean_policy;
 pub mod clean_skeleton;
+pub mod clean_sweep;
 pub mod completion;
 pub mod completion_validation;
 pub mod config_init;

@@ -6,7 +6,7 @@
 //! current repo into the latest array, and replaces the file atomically.
 //! Missing entries remain registered so an unmounted volume can return later.
 //!
-//! Selection always includes the current repo. All-repo selection adds the
+//! Selection includes the current repo when available. All-repo selection adds the
 //! registry and owners of linked worktrees at root, root/child, or
 //! root/child/grandchild. Ordinary folders and main-worktree `.git` directories
 //! do not discover repositories. Nothing in selection writes, fetches, or
@@ -55,8 +55,8 @@ pub fn register(repo: &Repository) -> anyhow::Result<()> {
 /// owners of linked worktrees found at most two folders below each root.
 /// Deduplicate repos; unreachable primary worktrees are skipped and reported,
 /// never interpreted as safe filesystem cleanup targets.
-pub fn load_repositories(
-    current: &Repository,
+pub fn load_repositories<'a>(
+    current: impl Into<Option<&'a Repository>>,
     all_repos: bool,
     roots: &[PathBuf],
 ) -> anyhow::Result<RepositorySelection> {
@@ -95,16 +95,20 @@ fn register_at(repo: &Repository, registry_path: &Path) -> anyhow::Result<()> {
     })
 }
 
-fn load_repositories_at(
-    current: &Repository,
+fn load_repositories_at<'a>(
+    current: impl Into<Option<&'a Repository>>,
     all_repos: bool,
     roots: &[PathBuf],
     registry_path: &Path,
 ) -> anyhow::Result<RepositorySelection> {
     let mut selection = RepositorySelection::default();
-    match repository_path(current) {
-        Ok(path) => selection.repositories.push(path),
-        Err(error) => selection.skip(current.discovery_path(), error)?,
+    if let Some(current) = current.into() {
+        match repository_path(current) {
+            Ok(path) => selection.repositories.push(path),
+            Err(error) => selection.skip(current.discovery_path(), error)?,
+        }
+    } else {
+        anyhow::ensure!(all_repos, "Run inside a repository or use --all-repos");
     }
     if all_repos {
         let repos: BTreeSet<PathBuf> = load_json(registry_path)?.unwrap_or_default();
