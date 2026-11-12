@@ -8,6 +8,8 @@
 //! saved patch/files (including primary env copies omitted from the attic).
 //! File stamps bracket hashing and the slow activity probe: same-status edits
 //! during either interval keep the worktree, even if its bytes are restored.
+//! Directory stamps include empty and ignored directories, where a new env
+//! file would change neither porcelain nor an ancestor directory's timestamp.
 //! Synchronous Repository::remove_worktree (the existing Git removal fallback)
 //! retains Git's lock/submodule/error checks at the original path, without the
 //! trash staging fast path moving the folder before Git can reject removal.
@@ -463,6 +465,20 @@ fn content_snapshot(
     let mut hash = Sha256::new();
     let patch = match source {
         ContentSource::Worktree => {
+            // Git's file inventory omits empty directories. Watch every real
+            // directory before reading content, without following symlinks or
+            // entering Git's administrative directory.
+            for entry in ignore::WalkBuilder::new(&facts.path)
+                .standard_filters(false)
+                .follow_links(false)
+                .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+                .build()
+            {
+                let entry = entry.context("Failed to inspect worktree directories")?;
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    watch_path(&mut stamps, entry.path(), &facts.path)?;
+                }
+            }
             let tracked = git_bytes(&facts.path, &["ls-files", "--cached", "-z"])?;
             for name in tracked
                 .split(|byte| *byte == 0)

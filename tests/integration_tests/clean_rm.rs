@@ -554,6 +554,20 @@ fn tests_that_clean_rm_keeps_edits_made_during_the_final_activity_probe() {
 }
 
 #[test]
+fn tests_that_clean_rm_keeps_new_env_files_in_previously_empty_directories() {
+    let f = Fixture::new();
+    fs::write(f.repo.path().join(".git/info/exclude"), "ignored/\n").unwrap();
+    let dir = f.path.join("ignored/empty");
+    fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join(".env.local");
+    f.on_second_activity_probe(&format!("printf secret > {}", quote(&secret)));
+    let rows = f.json(&["feature"], 1);
+    assert_eq!(rows[0]["reason"], "changed during backup");
+    assert_eq!(fs::read_to_string(secret).unwrap(), "secret");
+    assert!(f.exists_branch());
+}
+
+#[test]
 fn tests_that_clean_rm_after_rechecks_activity_after_backing_up() {
     let f = Fixture::new();
     f.unique_commit();
