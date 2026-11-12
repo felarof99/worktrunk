@@ -248,6 +248,24 @@ fn tests_that_backup_never_follows_tags() {
 }
 
 #[test]
+fn tests_that_a_symbolic_backup_ref_cannot_overwrite_the_default_branch() {
+    let test = feature("feature");
+    let original = remote_sha(&test, "refs/heads/main");
+    test.run_git_in(
+        test.remote_path().unwrap(),
+        &[
+            "symbolic-ref",
+            "refs/heads/wt-backup/feature",
+            "refs/heads/main",
+        ],
+    );
+    let repo = Repository::at(test.root_path()).unwrap();
+    let result = fetch_snapshot(&repo).and_then(|snapshot| backup(&repo, &facts(&test), &snapshot));
+    assert_eq!(remote_sha(&test, "refs/heads/main"), original);
+    assert!(matches!(result, Err(_) | Ok(BackupResult::Failed { .. })));
+}
+
+#[test]
 fn tests_that_replacement_commits_cannot_prove_remote_ancestry() {
     let test = feature("feature");
     let default_tip = test.git_output(&["rev-parse", "main"]);

@@ -7,6 +7,8 @@
 //! confirmation. Failed reads, pushes, and confirmations never authorize removal.
 //! Local replacement refs and grafts cannot supply ancestry evidence. Git's
 //! automatic tag and submodule pushes cannot widen the backup namespace.
+//! Advertised symbolic backup refs are refused: pushing to one follows its
+//! destination and can overwrite a normal branch even with an explicit refspec.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -62,6 +64,11 @@ fn parse_snapshot(remote: String, advertisement: &str) -> anyhow::Result<RemoteS
             .split_once('\t')
             .context("Malformed remote advertisement")?;
         if let Some(symref) = value.strip_prefix("ref: ") {
+            if reference.starts_with("refs/heads/wt-backup/") {
+                bail!(
+                    "Backup ref {reference} is symbolic; replace it with a direct ref before cleanup"
+                );
+            }
             if reference == "HEAD" && symref.starts_with("refs/heads/") {
                 default_branch_ref = Some(symref.to_string());
             }
