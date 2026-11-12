@@ -44,7 +44,7 @@ pub fn run(branch: &str, yes: bool) -> anyhow::Result<()> {
         "{}",
         progress_message(cformat!("Restoring worktree for <bold>{branch}</>..."))
     );
-    // TODO(clean): register the repo once piece D lands
+    super::registry::register(&repo)?;
     let entry = attic::load_latest(&repo, &branch)?;
     let local = has_ref(&repo, &format!("refs/heads/{branch}"))?;
     let base = if local {
