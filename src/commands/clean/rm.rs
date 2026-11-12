@@ -9,18 +9,20 @@
 //! File stamps bracket hashing and the slow activity probe: same-status edits
 //! during either interval keep the worktree, even if its bytes are restored.
 //! Directory stamps include empty and ignored directories (excluding opaque
-//! ignored repositories), where a new env
-//! file would change neither porcelain nor an ancestor directory's timestamp.
+//! ignored repositories), where a new env file would change neither porcelain
+//! nor an ancestor directory's timestamp.
 //! Synchronous Repository::remove_worktree (the existing Git removal fallback)
 //! retains Git's lock/submodule/error checks at the original path, without the
 //! trash staging fast path moving the folder before Git can reject removal.
 //!
 //! Delayed requests re-exec this binary through spawn_detached_exec, rooted
 //! outside the requested worktree. Their private stdin protocol records the
-//! original branch, tip, status and precise last-touch time. The shell binds
-//! the protocol marker to its PID before exec: nested wt invocations cannot
-//! inherit waiter mode. Requests carry no launch-directory dependency. Background hooks use read-only approvals unless -y
-//! was supplied. Every actual deletion still goes through remove_one.
+//! original branch, tip, status, precise last-touch time and invoking project
+//! config. The shell binds the protocol marker to its PID before exec: nested
+//! wt invocations cannot inherit waiter mode. Requests carry no launch-directory
+//! dependency. Captured hooks still pass through the approval gate; background
+//! hooks use read-only approvals unless -y was supplied. Every actual deletion
+//! goes through the same backup and removal checks.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -32,7 +34,7 @@ use anyhow::Context;
 use color_print::cformat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use worktrunk::config::{Approvals, UserConfig};
+use worktrunk::config::{Approvals, ProjectConfig, UserConfig};
 use worktrunk::git::{CommandError, ErrorExt, HookType, Repository, WorktreeInfo, WorktrunkError};
 use worktrunk::path::format_path_for_display;
 use worktrunk::shell_exec::Cmd;
@@ -275,6 +277,36 @@ pub fn remove_one(
     options: RemovalOptions,
     now: Timestamp,
 ) -> anyhow::Result<CleanRow> {
+    remove_one_with_hooks(
+        repo,
+        facts,
+        snapshot,
+        verdict,
+        options.dry_run,
+        now,
+        RemovalHooks::InvokingWorktree { yes: options.yes },
+    )
+}
+
+enum RemovalHooks<'a> {
+    InvokingWorktree {
+        yes: bool,
+    },
+    Scheduled {
+        project: Option<&'a ProjectConfig>,
+        yes: bool,
+    },
+}
+
+fn remove_one_with_hooks(
+    repo: &Repository,
+    facts: &WorktreeFacts,
+    snapshot: &RemoteSnapshot,
+    verdict: &Verdict,
+    dry_run: bool,
+    now: Timestamp,
+    hooks: RemovalHooks<'_>,
+) -> anyhow::Result<CleanRow> {
     if let Some(row) = keep_row(repo, facts, verdict)? {
         return Ok(row);
     }
@@ -292,7 +324,7 @@ pub fn remove_one(
             return Ok(row);
         }
     };
-    if options.dry_run {
+    if dry_run {
         let result = (|| {
             let on_remote = remote::tip_on_remote(repo, facts, snapshot)?;
             let reason = if on_remote {
@@ -379,7 +411,7 @@ pub fn remove_one(
         row.reason = DEFERRED.into();
         return Ok(row);
     }
-    let result = delete_backed_up(repo, facts, verdict, options, now, &content.hash, &mut row);
+    let result = delete_backed_up(repo, facts, verdict, hooks, now, &content.hash, &mut row);
     if let Err(error) = result {
         row.reason = error_reason(error)?;
     }
@@ -655,11 +687,11 @@ fn approve_hooks(
     repo: &Repository,
     facts: &WorktreeFacts,
     config: &UserConfig,
+    project: Option<&ProjectConfig>,
     yes: bool,
 ) -> anyhow::Result<ApprovedHookPlan> {
-    let project = repo.load_project_config()?;
     let project_id = repo.project_identifier().ok();
-    let mut builder = HookPlanBuilder::new(project.as_ref(), config, project_id.as_deref());
+    let mut builder = HookPlanBuilder::new(project, config, project_id.as_deref());
     builder.add(&facts.path, &[HookType::PreRemove, HookType::PostRemove]);
     let plan = builder.finish();
     if is_waiter() && !yes {
@@ -759,13 +791,21 @@ fn delete_backed_up(
     repo: &Repository,
     facts: &WorktreeFacts,
     verdict: &Verdict,
-    options: RemovalOptions,
+    hooks: RemovalHooks<'_>,
     now: Timestamp,
     content: &[u8; 32],
     row: &mut CleanRow,
 ) -> anyhow::Result<()> {
     let config = UserConfig::load()?;
-    let plan = approve_hooks(repo, facts, &config, options.yes)?;
+    let plan = match hooks {
+        RemovalHooks::InvokingWorktree { yes } => {
+            let project = repo.load_project_config()?;
+            approve_hooks(repo, facts, &config, project.as_ref(), yes)?
+        }
+        RemovalHooks::Scheduled { project, yes } => {
+            approve_hooks(repo, facts, &config, project, yes)?
+        }
+    };
     let primary = repo
         .primary_worktree()?
         .context("Primary worktree is unavailable")?;
@@ -946,6 +986,7 @@ struct DelayedRequest {
     status: Vec<u8>,
     last_touch: Timestamp,
     after: Duration,
+    project: Option<ProjectConfig>,
     yes: bool,
 }
 
@@ -972,6 +1013,7 @@ pub fn schedule(
         status: facts.status_porcelain.clone(),
         last_touch: facts.last_touch,
         after,
+        project: repo.load_project_config()?,
         yes: options.yes,
     };
     let root = repo.repo_path()?;
@@ -1033,16 +1075,17 @@ fn run_waiter() -> anyhow::Result<()> {
                 Verdict::Remove { .. } => {
                     eprintln!("{}", progress_message("Checking remote backup..."));
                     let snapshot = remote::fetch_snapshot(&repo)?;
-                    row = remove_one(
+                    row = remove_one_with_hooks(
                         &repo,
                         &facts,
                         &snapshot,
                         &verdict,
-                        RemovalOptions {
-                            dry_run: false,
+                        false,
+                        now(),
+                        RemovalHooks::Scheduled {
+                            project: request.project.as_ref(),
                             yes: request.yes,
                         },
-                        now(),
                     )?;
                 }
             }

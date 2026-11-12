@@ -596,6 +596,81 @@ fn tests_that_clean_rm_after_uses_only_approved_hooks_without_yes() {
 }
 
 #[test]
+fn tests_that_clean_rm_after_preserves_the_invoking_worktrees_removal_guard() {
+    let f = Fixture::new();
+    fs::create_dir(f.path.join(".config")).unwrap();
+    f.repo.commit_in_worktree(
+        &f.path,
+        ".config/wt.toml",
+        "pre-remove = 'exit 19'\n",
+        "guard removal",
+    );
+    rows(
+        f.command()
+            .current_dir(&f.path)
+            .args(["clean", "rm", "--after", "50ms", "-y", "--format", "json"])
+            .output()
+            .unwrap(),
+        0,
+    );
+    wait_for_file_content(&f.log());
+    let log = fs::read_to_string(f.log()).unwrap();
+    assert!(f.path.exists() && f.exists_branch(), "{log}");
+    assert!(log.contains("19"), "{log}");
+}
+
+#[test]
+fn tests_that_clean_rm_after_captures_hooks_before_the_launch_worktree_disappears() {
+    for yes in [false, true] {
+        let mut f = Fixture::new();
+        let starter = f.repo.add_worktree("starter");
+        let pre = f.bin.join("pre");
+        let post = f.bin.join("post");
+        f.project("pre-remove = 'exit 23'\n");
+        fs::create_dir(f.path.join(".config")).unwrap();
+        f.repo.commit_in_worktree(
+            &f.path,
+            ".config/wt.toml",
+            "pre-remove = 'exit 29'\n",
+            "different target hooks",
+        );
+        fs::create_dir(starter.join(".config")).unwrap();
+        f.repo.commit_in_worktree(
+            &starter,
+            ".config/wt.toml",
+            &format!(
+                "pre-remove = 'touch {}'\npost-remove = 'touch {}'\n",
+                pre.display(),
+                post.display()
+            ),
+            "launch hooks",
+        );
+        let mut command = f.command();
+        command.current_dir(&starter).args([
+            "clean", "rm", "feature", "--after", "1s", "--format", "json",
+        ]);
+        if yes {
+            command.arg("-y");
+        }
+        rows(command.output().unwrap(), 0);
+        f.repo
+            .run_git(&["worktree", "remove", starter.to_str().unwrap()]);
+        wait_for_file_content(&f.log());
+        assert!(
+            !f.path.exists() && !f.exists_branch(),
+            "{}",
+            fs::read_to_string(f.log()).unwrap()
+        );
+        assert_eq!(pre.exists(), yes);
+        if yes {
+            wait_for_file(&post);
+        } else {
+            assert!(!post.exists());
+        }
+    }
+}
+
+#[test]
 fn tests_that_clean_rm_keeps_on_push_or_attic_failure() {
     for attic_failure in [false, true] {
         let f = Fixture::new();

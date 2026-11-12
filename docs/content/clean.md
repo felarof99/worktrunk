@@ -92,7 +92,7 @@ Primary and pinned worktrees are refused. A busy worktree is backed up now and m
 
 {{ terminal(cmd="wt clean rm feature/auth|||wt clean rm feature/auth old-fix --dry-run|||wt clean rm feature/auth --after 10m|||wt clean rm feature/auth --wait 5s") }}
 
-With `--after`, the command returns immediately. A detached process waits outside the worktree, then backs up and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it keeps the worktree and logs the reason. `--after` and `--wait` cannot be combined.
+With `--after`, the command returns immediately. A detached process waits outside the worktree, then backs up and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it keeps the worktree and logs the reason. Project remove hooks are captured from the invoking worktree when scheduling and still require approval. `--after` and `--wait` cannot be combined.
 
 With `--wait`, the command stays in the foreground for up to the given duration until the worktree stops being busy, then backs up and removes it. If it is still busy when the wait ends, normal backup and deferral apply, with exit status 0.
 

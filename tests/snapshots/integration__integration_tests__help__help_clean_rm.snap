@@ -98,7 +98,7 @@ Primary and pinned worktrees are refused. A busy worktree is backed up now and m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--after[0m[2m 10m[0m
 [107m [0m [2m[0m[2m[34mwt[0m[2m clean rm feature/auth [0m[2m[36m--wait[0m[2m 5s[0m
 
-With [2m--after[0m, the command returns immediately. A detached process waits outside the worktree, then backs up and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it keeps the worktree and logs the reason. [2m--after[0m and [2m--wait[0m cannot be combined.
+With [2m--after[0m, the command returns immediately. A detached process waits outside the worktree, then backs up and removes only if the worktree is no longer busy and has not been touched since the request. Otherwise it keeps the worktree and logs the reason. Project remove hooks are captured from the invoking worktree when scheduling and still require approval. [2m--after[0m and [2m--wait[0m cannot be combined.
 
 With [2m--wait[0m, the command stays in the foreground for up to the given duration until the worktree stops being busy, then backs up and removes it. If it is still busy when the wait ends, normal backup and deferral apply, with exit status 0.
 
