@@ -14,7 +14,9 @@
 //! Restore checks every copy destination before applying the combined HEAD
 //! patch. Copies publish without replacing existing files, preserve symlinks,
 //! and refuse symlink directory components. Tracked files must be clean before
-//! patching. Entries survive both successful and failed restores until expiry.
+//! patching. Restored tracked changes are staged so gitlinks survive too;
+//! initialized submodule checkouts stay in place until `git submodule update`.
+//! Entries survive both successful and failed restores until expiry.
 //! Expiry walks exactly repo/branch/entry, never follows directory symlinks,
 //! and deletes only directories containing readable, typed metadata.
 
@@ -83,7 +85,14 @@ pub fn apply(entry: &AtticEntry, worktree: &Path) -> anyhow::Result<()> {
     }
     if !patch.is_empty() {
         let repo = Repository::at(&worktree)?;
-        let args = ["diff", "--quiet", "--no-ext-diff", "HEAD", "--"];
+        let args = [
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--ignore-submodules=none",
+            "HEAD",
+            "--",
+        ];
         let output = repo.worktree_at(&worktree).run_command_output(&args)?;
         match output.status.code() {
             Some(0) => {}
@@ -91,7 +100,7 @@ pub fn apply(entry: &AtticEntry, worktree: &Path) -> anyhow::Result<()> {
             _ => return Err(CommandError::from_failed_output("git", &args, &output).into()),
         }
         for check in [true, false] {
-            let mut args = vec!["apply", "--binary", "--whitespace=nowarn"];
+            let mut args = vec!["apply", "--index", "--binary", "--whitespace=nowarn"];
             if check {
                 args.push("--check");
             }
@@ -138,6 +147,8 @@ fn save_in(
             "--dst-prefix=b/",
             "--no-ext-diff",
             "--no-textconv",
+            "--ignore-submodules=none",
+            "--submodule=short",
             "HEAD",
             "--",
         ],
@@ -974,21 +985,131 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tests_that_submodule_commits_reachable_from_remote_refs_allow_saving() {
-        let (repo, _remote, path) = submodule_worktree();
+    fn published_submodule_worktree() -> (TestRepo, TestRepo, PathBuf, String) {
+        let (repo, remote, path) = submodule_worktree();
         init_submodule(&repo, &path);
         let sub = path.join("sub");
         repo.run_git_in(&sub, &["commit", "--allow-empty", "-m", "remote ancestor"]);
         repo.run_git_in(&sub, &["commit", "--allow-empty", "-m", "remote tip"]);
         repo.run_git_in(&sub, &["push", "origin", "HEAD:refs/heads/published"]);
         repo.run_git_in(&sub, &["checkout", "HEAD~"]);
+        let sha = repo.repo.worktree_at(&sub).head_sha().unwrap().unwrap();
+        (repo, remote, path, sha)
+    }
+
+    #[test]
+    fn tests_that_submodule_commits_reachable_from_remote_refs_round_trip() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
         let entry = saved(&repo, &path, "feature/auth", now());
-        assert!(
-            !fs::read(entry.path.join("tracked.patch"))
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
                 .unwrap()
+                .unwrap(),
+            sha
+        );
+        assert!(entry.path.join("meta.json").is_file());
+    }
+
+    #[test]
+    fn tests_that_ignored_submodule_diffs_still_round_trip() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        repo.run_git(&["config", "diff.ignoreSubmodules", "all"]);
+        assert!(
+            facts(&repo, &path, "feature/auth")
+                .status_porcelain
                 .is_empty()
         );
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn tests_that_log_submodule_diffs_still_round_trip() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        repo.run_git(&["config", "diff.submodule", "log"]);
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        apply(&entry, &dest).unwrap();
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn tests_that_restore_records_gitlinks_without_retargeting_initialized_submodules() {
+        let (mut repo, _remote, path, sha) = published_submodule_worktree();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        init_submodule(&repo, &dest);
+        let old_sha = repo
+            .repo
+            .worktree_at(dest.join("sub"))
+            .head_sha()
+            .unwrap()
+            .unwrap();
+        apply(&entry, &dest).unwrap();
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            old_sha
+        );
+        assert_eq!(
+            repo.repo
+                .worktree_at(&dest)
+                .run_command(&["rev-parse", ":sub"])
+                .unwrap()
+                .trim(),
+            sha
+        );
+        init_submodule(&repo, &dest);
+        assert_eq!(
+            repo.repo
+                .worktree_at(dest.join("sub"))
+                .head_sha()
+                .unwrap()
+                .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn tests_that_ignored_submodule_diffs_cannot_hide_restore_conflicts() {
+        let (mut repo, _remote, path, _sha) = published_submodule_worktree();
+        let entry = saved(&repo, &path, "feature/auth", now());
+        let dest = repo.add_worktree("restored");
+        init_submodule(&repo, &dest);
+        fs::write(dest.join("sub/file.txt"), "existing change").unwrap();
+        repo.run_git(&["config", "diff.ignoreSubmodules", "all"]);
+        assert!(apply(&entry, &dest).is_err());
+        assert_eq!(
+            fs::read(dest.join("sub/file.txt")).unwrap(),
+            b"existing change"
+        );
+        assert!(entry.path.join("meta.json").is_file());
     }
 
     #[test]
