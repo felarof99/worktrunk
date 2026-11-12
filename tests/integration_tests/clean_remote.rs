@@ -330,12 +330,50 @@ fn tests_that_unpublished_branches_preserve_slashes_in_the_backup_name() {
 }
 
 #[test]
-fn tests_that_detached_heads_use_the_worktree_folder_name() {
+fn tests_that_detached_heads_use_the_folder_and_tip_prefix() {
     let test = feature("feature");
     test.run_git(&["checkout", "--detach"]);
     assert_eq!(facts(&test).branch, None);
     let folder = test.root_path().file_name().unwrap().to_str().unwrap();
-    assert_pushed(&test, &format!("refs/heads/wt-backup/detached-{folder}"));
+    let tip = facts(&test).tip_sha;
+    assert_pushed(
+        &test,
+        &format!("refs/heads/wt-backup/detached-{folder}-{}", &tip[..12]),
+    );
+}
+
+#[test]
+fn tests_that_detached_worktrees_with_the_same_folder_keep_both_backups() {
+    let test = feature("feature");
+    let first = test.git_output(&["rev-parse", "HEAD"]);
+    test.commit("another detached tip");
+    let second = test.git_output(&["rev-parse", "HEAD"]);
+    let repo = Repository::at(test.root_path()).unwrap();
+    let snapshot = fetch_snapshot(&repo).unwrap();
+    for (parent, tip) in [("first", &first), ("second", &second)] {
+        let path = test.home_path().join(parent).join("source");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        test.run_git(&["worktree", "add", "--detach", path.to_str().unwrap(), tip]);
+        let mut observed = facts(&test);
+        observed.path = path;
+        observed.branch = None;
+        observed.tip_sha = tip.clone();
+        assert_eq!(
+            backup(&repo, &observed, &snapshot).unwrap(),
+            BackupResult::Pushed {
+                reference: format!("refs/heads/wt-backup/detached-source-{}", &tip[..12])
+            }
+        );
+    }
+    for tip in [first, second] {
+        assert_eq!(
+            remote_sha(
+                &test,
+                &format!("refs/heads/wt-backup/detached-source-{}", &tip[..12])
+            ),
+            tip
+        );
+    }
 }
 
 #[test]

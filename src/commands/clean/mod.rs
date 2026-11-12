@@ -64,7 +64,7 @@
 //!    advertised default-branch tip AND that object is local. Otherwise push
 //!    `git push --force <remote> <tip>:refs/heads/wt-backup/<branch>` and confirm
 //!    with `git ls-remote <remote> refs/heads/wt-backup/<branch>`. Detached HEAD
-//!    uses `wt-backup/detached-<worktree folder name>`.
+//!    uses `wt-backup/detached-<worktree folder name>-<first 12 chars of tip SHA>`.
 //! 3. If `git status --porcelain` is nonempty, or an ignored `.env*` differs
 //!    from the primary worktree's copy (including no copy there), save one
 //!    local attic entry under

@@ -152,7 +152,8 @@ pub fn tip_on_remote(
 // TODO(clean): used by pieces E and F, never during dry-run.
 /// Confirm an already-advertised tip or force-push it to the branch's wt-backup
 /// ref and verify that ref with ls-remote. Detached heads use their worktree
-/// folder name. Any push or confirmation failure prevents local deletion.
+/// folder name and first twelve tip SHA characters, so equal folder names do
+/// not overwrite different commits. Push or confirmation failure prevents deletion.
 pub fn backup(
     repo: &Repository,
     facts: &WorktreeFacts,
@@ -169,7 +170,7 @@ pub fn backup(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .context("Detached worktree has no UTF-8 folder name")?;
-            format!("detached-{folder}")
+            format!("detached-{folder}-{}", &facts.tip_sha[..12])
         }
     };
     let reference = format!("refs/heads/wt-backup/{branch}");
